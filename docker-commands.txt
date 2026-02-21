@@ -1,8 +1,0 @@
-# Run the container in interactive mode
-sudo docker run --gpus all -it -v /home/joeweibel-laptop/git/llm-finetuning/:/mnt/llm-finetuning --name pytorch_test pytorch/pytorch:latest
-
-# Remove all containers
-sudo docker rm -f $(sudo docker ps -a | grep -v NAMES | awk '{print $NF}')
-
-# Pull container
-docker pull pytorch/pytorch
