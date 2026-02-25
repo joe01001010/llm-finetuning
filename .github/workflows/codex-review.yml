@@ -1,18 +1,21 @@
-name: Codex Review
+name: AI PR Review (with context)
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, reopened, synchronize, ready_for_review]
 
 jobs:
-  codex-review:
+  ai_review:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    permissions:
+      contents: read
+      pull-requests: write
 
-      - name: Run Codex Reviewer
-        uses: openai/codex-reviewer@v1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run AI Code Review with Full File Context
+        uses: villesau/ai-code-review-action@v2.7.0
         with:
-          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          openai-key: ${{ secrets.OPENAI_API_KEY }}
+          include-full-files: true
