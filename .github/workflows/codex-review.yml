@@ -1,18 +1,54 @@
-name: Codex Review
+name: AI Code Review
 
 on:
+  push:
+    branches:
+      - main  # Run on pushes to main branch
   pull_request:
-    types: [opened, synchronize, reopened]
+    types:
+      - opened
+      - synchronize
+      - reopened
 
 jobs:
-  codex-review:
+  ai_review:
+    name: AI Code Review with OpenAI
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
 
-      - name: Run Codex Reviewer
-        uses: openai/codex-reviewer@v1
+    steps:
+      # Checkout the code
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      # Run the AI Review (example using OpenAI API integration)
+      - name: Run AI Code Review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }} # Store the OpenAI API key in secrets
+        run: |
+          # Install any necessary dependencies
+          pip install openai 
+
+          # Run the review script
+          python -c "
+          import openai
+          openai.api_key = '${{ secrets.OPENAI_API_KEY }}'
+
+          # Load your codebase files or diff contents for analysis
+          files_to_review = 'Add custom logic to list files or diffs'
+          
+          response = openai.ChatCompletion.create(
+              model='gpt-4',
+              messages=[
+                  {'role': 'system', 'content': 'You are an AI specialized in code reviews.'},
+                  {'role': 'user', 'content': f'Please review the following files: {files_to_review}'}
+              ]
+          )
+          print(response['choices'][0]['message']['content'])
+          "
+
+      # Publish results (optional)
+      - name: Upload Review Results
+        uses: actions/upload-artifact@v3
         with:
-          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          name: ai-code-review-results
+          path: review-results.txt
