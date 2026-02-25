@@ -31,16 +31,28 @@ jobs:
           # Run the review script
           python -c "
           import openai
-          openai.api_key = '${{ secrets.OPENAI_API_KEY }}'
-
-          # Load your codebase files or diff contents for analysis
-          files_to_review = 'Add custom logic to list files or diffs'
+          import os
           
+          openai.api_key = '${{ secrets.OPENAI_API_KEY }}'
+          
+          # Collect all files to review in the repository
+          repo_path = '.'
+          files_to_review = ''
+          for root, _, files in os.walk(repo_path):
+              for file in files:
+                  filepath = os.path.join(root, file)
+                  with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                      try:
+                          files_to_review += f'\n--- File: {filepath} ---\n' + f.read()
+                      except Exception as e:
+                          files_to_review += f'\n--- File: {filepath} could not be read: {e} ---\n'
+          
+          # Send files to the AI for review
           response = openai.ChatCompletion.create(
               model='gpt-4',
               messages=[
                   {'role': 'system', 'content': 'You are an AI specialized in code reviews.'},
-                  {'role': 'user', 'content': f'Please review the following files: {files_to_review}'}
+                  {'role': 'user', 'content': f'Please review the following repository contents: {files_to_review}'}
               ]
           )
           print(response['choices'][0]['message']['content'])
