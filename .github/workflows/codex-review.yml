@@ -25,38 +25,41 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }} # Store the OpenAI API key in secrets
         run: |
-          # Install any necessary dependencies
-          pip install openai 
+          # Install necessary dependencies
+          pip install openai
 
           # Run the review script
-          python -c "
+          python -c """
           import openai
           import os
-          
+
           openai.api_key = '${{ secrets.OPENAI_API_KEY }}'
-          
+
           # Collect all files to review in the repository
           repo_path = '.'
-          files_to_review = ''
+          files_to_review = []
           for root, _, files in os.walk(repo_path):
               for file in files:
                   filepath = os.path.join(root, file)
                   with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                       try:
-                          files_to_review += f'\n--- File: {filepath} ---\n' + f.read()
+                          files_to_review.append({'filename': filepath, 'content': f.read()})
                       except Exception as e:
-                          files_to_review += f'\n--- File: {filepath} could not be read: {e} ---\n'
-          
+                          files_to_review.append({'filename': filepath, 'content': f'Error reading file: {e}'})
+
           # Send files to the AI for review
+          messages = [{'role': 'system', 'content': 'You are an AI specialized in code reviews.'}]
+          for file in files_to_review:
+              messages.append({'role': 'user', 'content': f"Review this file: {file['filename']}
+
+{file['content']}"})
+
           response = openai.ChatCompletion.create(
               model='gpt-4',
-              messages=[
-                  {'role': 'system', 'content': 'You are an AI specialized in code reviews.'},
-                  {'role': 'user', 'content': f'Please review the following repository contents: {files_to_review}'}
-              ]
+              messages=messages
           )
           print(response['choices'][0]['message']['content'])
-          "
+          """
 
       # Publish results (optional)
       - name: Upload Review Results
