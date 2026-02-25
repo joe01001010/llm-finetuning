@@ -3,7 +3,7 @@ name: AI Code Review
 on:
   push:
     branches:
-      - main  # Run on pushes to main branch
+      - '**'
   pull_request:
     types:
       - opened
@@ -16,14 +16,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout the code
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      # Run the AI Review (example using OpenAI API integration)
       - name: Run AI Code Review
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }} # Store the OpenAI API key in secrets
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }} #
+
         run: |
           # Install any necessary dependencies
           pip install openai 
@@ -35,7 +34,6 @@ jobs:
           
           openai.api_key = '${{ secrets.OPENAI_API_KEY }}'
           
-          # Collect all files to review in the repository
           repo_path = '.'
           files_to_review = ''
           for root, _, files in os.walk(repo_path):
@@ -47,7 +45,6 @@ jobs:
                       except Exception as e:
                           files_to_review += f'\n--- File: {filepath} could not be read: {e} ---\n'
           
-          # Send files to the AI for review
           response = openai.ChatCompletion.create(
               model='gpt-4',
               messages=[
@@ -57,10 +54,3 @@ jobs:
           )
           print(response['choices'][0]['message']['content'])
           "
-
-      # Publish results (optional)
-      - name: Upload Review Results
-        uses: actions/upload-artifact@v3
-        with:
-          name: ai-code-review-results
-          path: review-results.txt
