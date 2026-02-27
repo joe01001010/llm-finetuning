@@ -29,16 +29,27 @@ jobs:
         run: |
           python <<'PY'
           import os
+          import sys
           from pathlib import Path
-          from openai import OpenAI
+          from openai import OpenAI, RateLimitError
 
           client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
           model = os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
 
           repo_root = Path(".").resolve()
           ignore_dirs = {".git", ".venv", "venv", "__pycache__"}
-          max_file_chars = 20000
-          max_total_chars = 400000
+
+          def env_int(name: str, default: int) -> int:
+              raw = os.environ.get(name)
+              if raw is None or not raw.strip():
+                  return default
+              try:
+                  return max(1, int(raw))
+              except ValueError:
+                  return default
+
+          max_file_chars = env_int("CODEX_MAX_FILE_CHARS", 8000)
+          max_total_chars = env_int("CODEX_MAX_TOTAL_CHARS", 160000)
           total_chars = 0
           files_payload = []
 
@@ -82,11 +93,24 @@ jobs:
           for chunk in files_payload:
               messages.append({"role": "user", "content": chunk})
 
-          response = client.chat.completions.create(
-              model=model,
-              messages=messages,
-              temperature=0.2,
-          )
+          try:
+              response = client.chat.completions.create(
+                  model=model,
+                  messages=messages,
+                  temperature=0.2,
+              )
+          except RateLimitError as err:
+              message = (
+                  "Codex review failed: OpenAI reported insufficient quota or rate limiting.\n"
+                  f"Model: {model}\n"
+                  f"Files sent: {len(files_payload)}\n"
+                  f"Characters sent: {total_chars}\n"
+                  "Consider lowering CODEX_MAX_TOTAL_CHARS / CODEX_MAX_FILE_CHARS or upgrading your plan.\n"
+                  f"Raw error: {err}"
+              )
+              Path("codex-review.md").write_text(message, encoding="utf-8")
+              print(message)
+              raise SystemExit(1)
 
           report = response.choices[0].message.content.strip()
           Path("codex-review.md").write_text(report, encoding="utf-8")
