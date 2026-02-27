@@ -1,5 +1,15 @@
+"""
+Full training pipeline for Qwen 7B fine-tuning.
+
+This script handles:
+- Pulling data from Kaggle
+- Data preprocessing
+- LoRA fine-tuning
+- PPO optimization
+- Evaluation and logging
+"""
 #!/usr/bin/env python
-# Main entry point for the python library
+
 
 from pathlib import Path
 import kagglehub
