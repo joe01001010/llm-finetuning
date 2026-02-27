@@ -23,13 +23,13 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          pip install openai
+          pip install "openai>=1.0.0"
 
           python <<'PY'
           import os
-          import openai
+          from openai import OpenAI
 
-          openai.api_key = os.environ['OPENAI_API_KEY']
+          client = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
 
           repo_path = '.'
           files_to_review = []
@@ -48,9 +48,9 @@ jobs:
               contents = file['content']
               messages.append({'role': 'user', 'content': f'Review this file: {name}: {contents}'})
 
-          response = openai.ChatCompletion.create(
+          response = client.chat.completions.create(
               model='gpt-4',
               messages=messages
           )
-          print(response['choices'][0]['message']['content'])
+          print(response.choices[0].message.content)
           PY
