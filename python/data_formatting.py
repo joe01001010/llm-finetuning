@@ -15,8 +15,8 @@ Date: 26 Feb 2026
 
 
 from pathlib import Path
-import kagglehub
 import json
+import kagglehub
 import pandas as pd
 
 
@@ -84,7 +84,7 @@ def format_data(path_to_dataset):
     df = df.sort_values('date').drop_duplicates(subset=['date']).reset_index(drop=True)
     df = df.dropna().reset_index(drop=True)
     return df
-  
+
 
 def write_samples(data_frame):
     """
