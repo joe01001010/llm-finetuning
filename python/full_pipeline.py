@@ -7,6 +7,9 @@ This script handles:
 - LoRA fine-tuning
 - PPO optimization
 - Evaluation and logging
+
+Author: Joe Weibel
+Date: 26 Feb 2026
 """
 #!/usr/bin/env python
 
