@@ -43,7 +43,9 @@ jobs:
           # Send files to the AI for review
           messages = [{'role': 'system', 'content': 'You are an AI specialized in code reviews.'}]
           for file in files_to_review:
-              messages.append({'role': 'user', 'content': f"Review this file: {file['filename']}: {file['content']}"})
+              name = file['filename']
+              contents = file['content']
+              messages.append({'role': 'user', 'content': f'Review this file: {name}: {contents}'})
 
           response = openai.ChatCompletion.create(
               model='gpt-4',
