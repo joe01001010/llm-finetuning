@@ -24,11 +24,20 @@ apt update
 apt upgrade -y
 apt install -y curl ca-certificates gnupg
 
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null
+stat /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+if [[ $? -ne 0 ]]
+then
+  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+    | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+fi
+
+stat /etc/apt/sources.list.d/nvidia-container-toolkit.list
+if [[ $? -ne 0 ]]
+then
+  curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+    | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null
+fi
 
 apt update
 apt install -y nvidia-container-toolkit docker.io
@@ -51,6 +60,7 @@ containers=$(docker images | grep ${DOCKER_IMAGE_NAME} | grep ${DOCKER_IMAGE_VER
 if [[ $? -ne 0 ]]
 then
   docker pull ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_VERSION}
+  containers=$(docker images | grep ${DOCKER_IMAGE_NAME} | grep ${DOCKER_IMAGE_VERSION} | awk '{print $3}')
 fi
 
 echo ""
