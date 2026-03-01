@@ -24,7 +24,8 @@ SYSTEM = "You are a weather forecasting assistant. You should only output in JSO
 FEATURE_COLUMNS = ['temp_max', 'temp_min', 'precipitation', 'wind', 'weather']
 EXTERNAL_DATASET = "seattle-weather.csv"
 WINDOW_SIZES = [7, 14, 21, 28]
-JSON_OUT_PATH = "seattle_weather_chat.json"
+PROJ_DIR = Path(__file__).resolve().parent.parent
+JSON_OUT_PATH = f"{PROJ_DIR}/data/seattle_weather_chat.json"
 
 
 def format_day(row, day_offset):
@@ -127,7 +128,7 @@ def main():
     This program will clean and format the data for the AI agent to receive
     """
     weather_data_path = pull_data("ananthr1/weather-prediction",
-        Path(__file__).resolve().parent.parent / "data" / "weather-prediction")
+        PROJ_DIR / "data" / "weather-prediction")
     pandas_data = format_data(weather_data_path + "/" + EXTERNAL_DATASET)
     write_samples(pandas_data)
 

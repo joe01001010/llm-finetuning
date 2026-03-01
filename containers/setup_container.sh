@@ -62,6 +62,7 @@ then
   docker pull ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_VERSION}
   containers=$(docker images | grep ${DOCKER_IMAGE_NAME} | grep ${DOCKER_IMAGE_VERSION} | awk '{print $3}')
 fi
+docker rm -f llm-finetuning
 
 echo ""
 echo "====================================="
@@ -76,6 +77,6 @@ else
   echo "Ensure existing containers of the same name are removed:"
   echo "docker rm -f $(docker ps -a | grep llm-finetuning)"
   echo "Run your container with the following command:"
-  echo "docker run -it --name=llm-finetuning --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${containers}"
+  echo "docker run -it -v ~/.cache:/root/.cache -v /tmp/:/local-containers -v $(pwd):/llm-finetuning --name=llm-finetuning --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${containers}"
   exit 0
 fi
