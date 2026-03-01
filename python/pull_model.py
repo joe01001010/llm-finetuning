@@ -26,6 +26,7 @@ def main():
             local_dir = MODEL_DIR,
             local_dir_use_symlinks = False,
         )
+        print(f"Downloaded model {MODEL_ID}: {path}")
 
 
 if __name__ == '__main__':
