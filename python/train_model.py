@@ -6,6 +6,7 @@ This will only train and save the lora parameters
 #!/usr/bin/env python
 
 
+import argparse
 import sys
 from pathlib import Path
 import torch
@@ -20,20 +21,53 @@ DATA_PATH = f"{Path(__file__).resolve().parent.parent}/data/seattle_weather_chat
 OUTPUT_DIR = "./lora-weights"
 
 
-def create_model():
-    bits_and_bytes = BitsAndBytesConfig(
-        load_in_4bit = True,
-        bnb_4bit_quant_type = "nf4",
-        bnb_4bit_use_double_quant = True,
-        bnb_4bit_compute_dtype = torch.bfloat16,
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train LoRA/QLoRA adapters on the Seattle weather chat dataset."
     )
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=True)
-    base_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
-        quantization_config = bits_and_bytes,
-        device_map="auto"
-    )
-    base_model = prepare_model_for_kbit_training(base_model)
+    parser.add_argument("--mode", choices=["lora", "qlora"], default="qlora")
+    parser.add_argument("--model-path", default=MODEL_PATH)
+    parser.add_argument("--data-path", default=DATA_PATH)
+    parser.add_argument("--output-dir", default=OUTPUT_DIR)
+    parser.add_argument("--num-train-epochs", type=float, default=1.0)
+    parser.add_argument("--per-device-train-batch-size", type=int, default=1)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--save-steps", type=int, default=200)
+    parser.add_argument("--logging-steps", type=int, default=10)
+    parser.add_argument("--max-length", type=int, default=1024)
+    return parser.parse_args()
+
+
+def create_model(mode, model_path):
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+
+    if mode == "qlora":
+        bits_and_bytes = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            quantization_config=bits_and_bytes,
+            device_map="auto"
+        )
+        base_model = prepare_model_for_kbit_training(base_model)
+    else:
+        if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
+            dtype = torch.bfloat16
+        elif torch.cuda.is_available():
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            device_map="auto",
+        )
 
     lora_cfg = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -60,13 +94,13 @@ def train_lora_sft(
     tokenizer,
     data_path,
     output_dir,
-    max_length = 1024,
-    num_train_epochs = 1,
-    per_device_train_batch_size = 1,
-    gradient_accumulation_steps = 8,
-    learning_rate = 2e-4,
-    save_steps = 200,
-    logging_steps = 10):
+    max_length=1024,
+    num_train_epochs=1,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    learning_rate=2e-4,
+    save_steps=200,
+    logging_steps=10):
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -137,13 +171,20 @@ def train_lora_sft(
 
 
 def main():
-    model, tokenizer = create_model()
+    args = parse_args()
+    model, tokenizer = create_model(mode=args.mode, model_path=args.model_path)
     train_lora_sft(
         model=model,
         tokenizer=tokenizer,
-        data_path=DATA_PATH,
-        output_dir=OUTPUT_DIR,
-        num_train_epochs=1,
+        data_path=args.data_path,
+        output_dir=args.output_dir,
+        max_length=args.max_length,
+        num_train_epochs=args.num_train_epochs,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        save_steps=args.save_steps,
+        logging_steps=args.logging_steps,
     )
 
 

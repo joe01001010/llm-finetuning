@@ -143,6 +143,38 @@ def first_present_key(record: dict[str, Any], keys: list[str]) -> str | None:
     return None
 
 
+def extract_chat_prompt_and_reference(
+    record: dict[str, Any],
+) -> tuple[list[dict[str, str]], str | None] | None:
+    messages = record.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+
+    normalized_messages = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role is None or content is None:
+            continue
+        normalized_messages.append({"role": str(role), "content": str(content)})
+
+    if not normalized_messages:
+        return None
+
+    reference = None
+    prompt_messages = normalized_messages
+    if normalized_messages[-1]["role"] == "assistant":
+        reference = normalized_messages[-1]["content"]
+        prompt_messages = normalized_messages[:-1]
+
+    if not prompt_messages:
+        return None
+
+    return prompt_messages, reference
+
+
 def normalize_text(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
@@ -193,6 +225,13 @@ def extract_examples(
                 break
 
     if not resolved_prompt_key:
+        for record in records:
+            parsed = extract_chat_prompt_and_reference(record)
+            if parsed is not None:
+                resolved_prompt_key = "messages"
+                break
+
+    if not resolved_prompt_key:
         raise ValueError(
             "Could not infer prompt key. Pass --prompt-key explicitly."
         )
@@ -206,6 +245,31 @@ def extract_examples(
 
     examples = []
     for i, record in enumerate(records):
+        if resolved_prompt_key == "messages":
+            parsed = extract_chat_prompt_and_reference(record)
+            if parsed is None:
+                continue
+            prompt_messages, inferred_reference = parsed
+            prompt = "\n".join(
+                f"{item['role']}: {item['content']}" for item in prompt_messages
+            )
+            reference = inferred_reference
+            if resolved_reference_key and resolved_reference_key in record:
+                ref_value = record.get(resolved_reference_key)
+                if ref_value is not None:
+                    reference = str(ref_value)
+
+            examples.append(
+                {
+                    "id": i,
+                    "prompt": prompt,
+                    "chat_messages": prompt_messages,
+                    "reference": reference,
+                    "raw": record,
+                }
+            )
+            continue
+
         if resolved_prompt_key not in record:
             continue
         prompt_value = record.get(resolved_prompt_key, "")
@@ -227,6 +291,9 @@ def extract_examples(
         raise ValueError(
             f"No usable examples found with prompt key '{resolved_prompt_key}'."
         )
+
+    if resolved_prompt_key == "messages" and resolved_reference_key is None:
+        resolved_reference_key = "messages[-1].assistant"
 
     return examples, resolved_prompt_key, resolved_reference_key
 
@@ -276,7 +343,7 @@ def apply_lora(model, adapter_path: str):
 def generate_one(
     model,
     tokenizer,
-    prompt: str,
+    example: dict[str, Any],
     max_new_tokens: int,
     temperature: float,
     top_p: float,
@@ -284,7 +351,16 @@ def generate_one(
 ) -> tuple[str, float]:
     import torch
 
-    inputs = tokenizer(prompt, return_tensors="pt")
+    prompt_text = example["prompt"]
+    chat_messages = example.get("chat_messages")
+    if chat_messages is not None and hasattr(tokenizer, "apply_chat_template"):
+        prompt_text = tokenizer.apply_chat_template(
+            chat_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    inputs = tokenizer(prompt_text, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     input_len = inputs["input_ids"].shape[1]
 
@@ -330,7 +406,7 @@ def evaluate_model(
         prediction, latency = generate_one(
             model=model,
             tokenizer=tokenizer,
-            prompt=ex["prompt"],
+            example=ex,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
