@@ -116,6 +116,7 @@ Output:
 - `lora`: non-quantized base model loading
 
 ### Train QLoRA
+- `Training Time: 1 Hour 17 Minutes`
 
 ```bash
 cd /llm-finetuning
@@ -128,6 +129,7 @@ python python/train_model.py \
 ```
 
 ### Train LoRA
+- `Training Time: 2 Hour 54 Minutes`
 
 ```bash
 cd /llm-finetuning
@@ -136,7 +138,10 @@ python python/train_model.py \
   --model-path /local-containers/Qwen2-7B-Instruct \
   --data-path /llm-finetuning/data/seattle_weather_chat.json \
   --output-dir /llm-finetuning/lora-weights/lora \
-  --num-train-epochs 1
+  --num-train-epochs 1 \
+  --max-length 512 \
+  --per-device-train-batch-size 1 \
+  --gradient-accumulation-steps 16
 ```
 
 Common tunables:

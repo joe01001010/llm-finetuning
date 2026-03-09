@@ -77,6 +77,6 @@ else
   echo "Ensure existing containers of the same name are removed:"
   echo "docker rm -f $(docker ps -a | grep llm-finetuning)"
   echo "Run your container with the following command:"
-  echo "docker run -it -v /home/${1}/.cache:/root/.cache -v /tmp/:/local-containers -v $(pwd):/llm-finetuning --name=llm-finetuning --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${containers}"
+  echo "docker run -it -v /home/${1}/.cache:/root/.cache -v /tmp:/local-containers -v $(pwd):/llm-finetuning --name llm-finetuning --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ${containers}"
   exit 0
 fi
