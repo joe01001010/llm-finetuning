@@ -71,7 +71,7 @@ def create_model(mode, model_path):
         base_model = AutoModelForCausalLM.from_pretrained(
             model_path,
             dtype=dtype,
-            device_map="auto",
+            low_cpu_mem_usage=False,
         )
 
     lora_cfg = LoraConfig(
