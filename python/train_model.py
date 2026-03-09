@@ -35,7 +35,12 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--save-steps", type=int, default=200)
     parser.add_argument("--logging-steps", type=int, default=10)
-    parser.add_argument("--max-length", type=int, default=1024)
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=0,
+        help="Token truncation length. 0 uses mode defaults (LoRA=512, QLoRA=1024).",
+    )
     return parser.parse_args()
 
 
@@ -65,7 +70,7 @@ def create_model(mode, model_path):
 
         base_model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=dtype,
+            dtype=dtype,
             device_map="auto",
         )
 
@@ -79,6 +84,11 @@ def create_model(mode, model_path):
     )
 
     model = get_peft_model(base_model, lora_cfg)
+    model.config.use_cache = False
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
     model.print_trainable_parameters()
     if torch.cuda.is_available():
         print("GPU:", torch.cuda.get_device_name(0))
@@ -126,7 +136,7 @@ def train_lora_sft(
             batch["text"],
             truncation=True,
             max_length=max_length,
-            padding="max_length",
+            padding=False,
         )
         # Trainer will use labels for causal LM; copy input_ids
         toks["labels"] = toks["input_ids"].copy()
@@ -172,20 +182,35 @@ def train_lora_sft(
 
 def main():
     args = parse_args()
+    max_length = args.max_length or (512 if args.mode == "lora" else 1024)
+
     model, tokenizer = create_model(mode=args.mode, model_path=args.model_path)
-    train_lora_sft(
-        model=model,
-        tokenizer=tokenizer,
-        data_path=args.data_path,
-        output_dir=args.output_dir,
-        max_length=args.max_length,
-        num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        save_steps=args.save_steps,
-        logging_steps=args.logging_steps,
-    )
+    try:
+        train_lora_sft(
+            model=model,
+            tokenizer=tokenizer,
+            data_path=args.data_path,
+            output_dir=args.output_dir,
+            max_length=max_length,
+            num_train_epochs=args.num_train_epochs,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            learning_rate=args.learning_rate,
+            save_steps=args.save_steps,
+            logging_steps=args.logging_steps,
+        )
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower():
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            suggested_max_length = max(256, max_length // 2)
+            raise SystemExit(
+                f"CUDA OOM during {args.mode.upper()} training.\n"
+                f"Try rerunning with a smaller sequence length, for example:\n"
+                f"  --max-length {suggested_max_length}\n"
+                f"and optionally increase gradient accumulation (e.g. --gradient-accumulation-steps 16)."
+            ) from exc
+        raise
 
 
 if __name__ == '__main__':
