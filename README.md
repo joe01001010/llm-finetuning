@@ -22,7 +22,7 @@ End-to-end local workflow for:
 - `python/pull_model.py`: downloads the base model to `/local-containers/Qwen2-7B-Instruct`.
 - `python/data_formatting.py`: pulls weather dataset from Kaggle and writes `data/seattle_weather_chat.json`.
 - `python/train_model.py`: trains adapter weights (`--mode lora` or `--mode qlora`).
-- `python/evaluate_models.py`: compares base model vs one adapter.
+- `python/evaluate_models.py`: compares base vs LoRA vs QLoRA in one run.
 - `lora-weights/`: default adapter output location.
 
 ## Prerequisites
@@ -150,60 +150,37 @@ Common tunables:
 - `--learning-rate`
 - `--max-length`
 
-## 7) Evaluate Base vs Adapter
+## 7) Evaluate Base vs LoRA vs QLoRA
 
-`evaluate_models.py` compares:
+`evaluate_models.py` runs all 3 variants in one pass:
 - base model (`--base-model`)
-- base + one adapter (`--lora-adapter`)
+- base + LoRA (`--lora-adapter`)
+- base + QLoRA (`--qlora-adapter`)
 
-It writes a summary report and optional per-sample predictions.
+It writes:
+- a summary report with `accuracy`, `hallucination_rate`, `a1_score`, plus EM/F1
+- optional per-sample predictions with side-by-side outputs
 
 ```bash
 mkdir -p /llm-finetuning/reports
 ```
-
-### Base vs QLoRA
-
-```bash
-cd /llm-finetuning
-python python/evaluate_models.py \
-  --base-model /local-containers/Qwen2-7B-Instruct \
-  --lora-adapter /llm-finetuning/lora-weights/qlora \
-  --dataset /llm-finetuning/data/seattle_weather_chat.json \
-  --output-report /llm-finetuning/reports/base_vs_qlora.json \
-  --output-predictions /llm-finetuning/reports/base_vs_qlora_predictions.jsonl \
-  --max-samples 200
-```
-
-### Base vs LoRA
 
 ```bash
 cd /llm-finetuning
 python python/evaluate_models.py \
   --base-model /local-containers/Qwen2-7B-Instruct \
   --lora-adapter /llm-finetuning/lora-weights/lora \
+  --qlora-adapter /llm-finetuning/lora-weights/qlora \
   --dataset /llm-finetuning/data/seattle_weather_chat.json \
-  --output-report /llm-finetuning/reports/base_vs_lora.json \
-  --output-predictions /llm-finetuning/reports/base_vs_lora_predictions.jsonl \
+  --output-report /llm-finetuning/reports/base_lora_qlora.json \
+  --output-predictions /llm-finetuning/reports/base_lora_qlora_predictions.jsonl \
   --max-samples 200
 ```
 
-## 8) Compare LoRA vs QLoRA Reports
-
-After both evaluations complete:
+Optional for lower VRAM:
 
 ```bash
-python - <<'PY'
-import json
-from pathlib import Path
-
-lora = json.loads(Path("/llm-finetuning/reports/base_vs_lora.json").read_text())
-qlora = json.loads(Path("/llm-finetuning/reports/base_vs_qlora.json").read_text())
-
-print("LoRA summary:", json.dumps(lora["base_plus_lora"], indent=2))
-print("QLoRA summary:", json.dumps(qlora["base_plus_lora"], indent=2))
-print("Base summary (LoRA run):", json.dumps(lora["base_model"], indent=2))
-PY
+python python/evaluate_models.py ... --load-in-4bit
 ```
 
 ## Troubleshooting
