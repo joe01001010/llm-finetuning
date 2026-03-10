@@ -104,25 +104,42 @@ def resolve_project_path(path_value: str, project_root: Path) -> Path:
     return project_root / path
 
 
+def parse_jsonl_records(text: str, path: Path) -> list[dict[str, Any]]:
+    records = []
+    for i, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSONL at line {i}: {exc}") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"JSONL line {i} is not an object.")
+        records.append(row)
+    return records
+
+
 def load_records(path: Path) -> list[dict[str, Any]]:
+    text = path.read_text(encoding="utf-8")
+
+    # Respect explicit .jsonl extension first.
     if path.suffix.lower() == ".jsonl":
-        records = []
-        with path.open("r", encoding="utf-8") as f:
-            for i, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"Invalid JSONL at line {i}: {exc}") from exc
-                if not isinstance(row, dict):
-                    raise ValueError(f"JSONL line {i} is not an object.")
-                records.append(row)
+        records = parse_jsonl_records(text, path)
+        if not records:
+            raise ValueError("JSONL dataset is empty.")
         return records
 
-    with path.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # Common case: dataset is JSONL but saved with .json extension.
+        if exc.msg == "Extra data":
+            records = parse_jsonl_records(text, path)
+            if not records:
+                raise ValueError("JSONL dataset is empty.")
+            return records
+        raise ValueError(f"Invalid JSON dataset: {exc}") from exc
 
     if isinstance(payload, list):
         if not all(isinstance(item, dict) for item in payload):
@@ -133,6 +150,8 @@ def load_records(path: Path) -> list[dict[str, Any]]:
             if not all(isinstance(item, dict) for item in payload["data"]):
                 raise ValueError("JSON data list must contain objects.")
             return payload["data"]
+        # Support a single-record JSON object.
+        return [payload]
     raise ValueError("Unsupported dataset format. Use JSONL or JSON list/object with 'data'.")
 
 
