@@ -1,14 +1,4 @@
 #!/usr/bin/env python
-"""
-Compare a base causal LM against the same model with a LoRA adapter.
-
-Expected dataset format (JSONL or JSON):
-- Each sample should include a prompt-like field:
-  prompt | input | instruction | question | text
-- Optional reference field for scoring:
-  reference | target | answer | output | response
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -19,550 +9,422 @@ import time
 from pathlib import Path
 from typing import Any
 
-SCRIPT_PATH = Path(__file__).resolve()
-PROJECT_ROOT = SCRIPT_PATH.parent.parent
-EXPECTED_PROJECT_NAME = "llm-finetuning"
+SCRIPT = Path(__file__).resolve()
+ROOT = SCRIPT.parent.parent
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Evaluate base model vs base+LoRA on the same prompts."
-    )
-    parser.add_argument("--base-model", required=True, help="HF model id or local path")
-    parser.add_argument(
-        "--lora-adapter", required=True, help="Path or HF repo for the LoRA adapter"
-    )
-    parser.add_argument("--dataset", required=True, help="Path to .json or .jsonl data")
-    parser.add_argument(
-        "--output-report",
-        default="lora_eval_report.json",
-        help="Output JSON report path",
-    )
-    parser.add_argument(
-        "--output-predictions",
-        default="",
-        help="Optional output JSONL with per-sample predictions",
-    )
-    parser.add_argument(
-        "--max-samples",
-        type=int,
-        default=100,
-        help="Max samples to evaluate (after optional shuffle)",
-    )
-    parser.add_argument(
-        "--shuffle",
-        action="store_true",
-        help="Shuffle samples before truncating to max-samples",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--max-new-tokens", type=int, default=128)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="Pass trust_remote_code=True when loading model/tokenizer",
-    )
-    parser.add_argument(
-        "--prompt-key",
-        default="",
-        help="Explicit prompt key. If omitted, a default key search is used.",
-    )
-    parser.add_argument(
-        "--reference-key",
-        default="",
-        help="Explicit reference key. If omitted, a default key search is used.",
-    )
-    return parser.parse_args()
+def args_parser() -> argparse.Namespace:
+    p = argparse.ArgumentParser("Evaluate base vs LoRA vs QLoRA")
+    p.add_argument("--base-model", required=True)
+    p.add_argument("--lora-adapter", required=True)
+    p.add_argument("--qlora-adapter", required=True)
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--output-report", required=True)
+    p.add_argument("--output-predictions", default="")
+    p.add_argument("--max-samples", type=int, default=200)
+    p.add_argument("--shuffle", action="store_true")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--max-new-tokens", type=int, default=128)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--load-in-4bit", action="store_true")
+    p.add_argument("--trust-remote-code", action="store_true")
+    return p.parse_args()
 
 
-def ensure_llm_finetuning_project() -> Path:
-    if PROJECT_ROOT.name != EXPECTED_PROJECT_NAME:
-        raise SystemExit(
-            f"This script only runs inside '{EXPECTED_PROJECT_NAME}'. "
-            f"Detected project root: {PROJECT_ROOT}"
-        )
-
-    required_paths = [
-        PROJECT_ROOT / "python" / "train_model.py",
-        PROJECT_ROOT / "requirements.txt",
-    ]
-    missing = [str(path.relative_to(PROJECT_ROOT)) for path in required_paths if not path.exists()]
-    if missing:
-        raise SystemExit(
-            "Project validation failed. Missing required files: "
-            + ", ".join(missing)
-        )
-
-    return PROJECT_ROOT
-
-
-def resolve_project_path(path_value: str, project_root: Path) -> Path:
-    path = Path(path_value)
-    if path.is_absolute():
-        return path
-    return project_root / path
+def resolve(path_s: str) -> Path:
+    p = Path(path_s)
+    return p if p.is_absolute() else ROOT / p
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
+    text = path.read_text(encoding="utf-8")
     if path.suffix.lower() == ".jsonl":
-        records = []
-        with path.open("r", encoding="utf-8") as f:
-            for i, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"Invalid JSONL at line {i}: {exc}") from exc
-                if not isinstance(row, dict):
-                    raise ValueError(f"JSONL line {i} is not an object.")
-                records.append(row)
-        return records
-
-    with path.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
-
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+        return [r for r in rows if isinstance(r, dict)]
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        if exc.msg != "Extra data":
+            raise
+        rows = []
+        for i, line in enumerate(text.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSONL at line {i}: {e}") from e
+            if isinstance(item, dict):
+                rows.append(item)
+        return rows
     if isinstance(payload, list):
-        if not all(isinstance(item, dict) for item in payload):
-            raise ValueError("JSON list dataset must contain objects.")
-        return payload
+        return [x for x in payload if isinstance(x, dict)]
     if isinstance(payload, dict):
-        if "data" in payload and isinstance(payload["data"], list):
-            if not all(isinstance(item, dict) for item in payload["data"]):
-                raise ValueError("JSON data list must contain objects.")
-            return payload["data"]
-    raise ValueError("Unsupported dataset format. Use JSONL or JSON list/object with 'data'.")
+        if isinstance(payload.get("data"), list):
+            return [x for x in payload["data"] if isinstance(x, dict)]
+        return [payload]
+    return []
 
 
-def first_present_key(record: dict[str, Any], keys: list[str]) -> str | None:
-    for key in keys:
-        if key in record:
-            return key
+def extract_examples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ex = []
+    for i, row in enumerate(rows):
+        msgs = row.get("messages")
+        if isinstance(msgs, list) and msgs:
+            clean = []
+            for m in msgs:
+                if isinstance(m, dict) and m.get("role") is not None and m.get("content") is not None:
+                    clean.append({"role": str(m["role"]), "content": str(m["content"])})
+            if not clean:
+                continue
+            ref = None
+            if clean[-1]["role"] == "assistant":
+                ref = clean[-1]["content"]
+                clean = clean[:-1]
+            if clean:
+                ex.append({"id": i, "messages": clean, "prompt": "\n".join(f"{m['role']}: {m['content']}" for m in clean), "reference": ref})
+            continue
+        for key in ("prompt", "input", "instruction", "question", "text"):
+            if key in row and row[key] is not None and str(row[key]).strip():
+                ref = None
+                for rk in ("reference", "target", "answer", "output", "response"):
+                    if rk in row and row[rk] is not None:
+                        ref = str(row[rk])
+                        break
+                ex.append({"id": i, "prompt": str(row[key]), "reference": ref})
+                break
+    return ex
+
+
+def norm(s: str) -> str:
+    return " ".join(s.strip().lower().split())
+
+
+def token_f1(pred: str, ref: str) -> float:
+    a = norm(pred).split()
+    b = norm(ref).split()
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    ca: dict[str, int] = {}
+    cb: dict[str, int] = {}
+    for t in a:
+        ca[t] = ca.get(t, 0) + 1
+    for t in b:
+        cb[t] = cb.get(t, 0) + 1
+    common = sum(min(v, cb.get(k, 0)) for k, v in ca.items())
+    if common == 0:
+        return 0.0
+    p = common / len(a)
+    r = common / len(b)
+    return 2 * p * r / (p + r)
+
+
+def first_json_obj(text: str) -> str | None:
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                return text[start : i + 1]
     return None
 
 
-def extract_chat_prompt_and_reference(
-    record: dict[str, Any],
-) -> tuple[list[dict[str, str]], str | None] | None:
-    messages = record.get("messages")
-    if not isinstance(messages, list) or not messages:
-        return None
-
-    normalized_messages = []
-    for item in messages:
-        if not isinstance(item, dict):
-            continue
-        role = item.get("role")
-        content = item.get("content")
-        if role is None or content is None:
-            continue
-        normalized_messages.append({"role": str(role), "content": str(content)})
-
-    if not normalized_messages:
-        return None
-
-    reference = None
-    prompt_messages = normalized_messages
-    if normalized_messages[-1]["role"] == "assistant":
-        reference = normalized_messages[-1]["content"]
-        prompt_messages = normalized_messages[:-1]
-
-    if not prompt_messages:
-        return None
-
-    return prompt_messages, reference
-
-
-def normalize_text(text: str) -> str:
-    return " ".join(text.strip().lower().split())
-
-
-def token_f1(prediction: str, reference: str) -> float:
-    pred_tokens = normalize_text(prediction).split()
-    ref_tokens = normalize_text(reference).split()
-    if not pred_tokens and not ref_tokens:
-        return 1.0
-    if not pred_tokens or not ref_tokens:
-        return 0.0
-
-    pred_counts: dict[str, int] = {}
-    ref_counts: dict[str, int] = {}
-    for token in pred_tokens:
-        pred_counts[token] = pred_counts.get(token, 0) + 1
-    for token in ref_tokens:
-        ref_counts[token] = ref_counts.get(token, 0) + 1
-
-    common = 0
-    for token, pred_count in pred_counts.items():
-        common += min(pred_count, ref_counts.get(token, 0))
-
-    if common == 0:
-        return 0.0
-
-    precision = common / len(pred_tokens)
-    recall = common / len(ref_tokens)
-    return 2 * precision * recall / (precision + recall)
-
-
-def extract_examples(
-    records: list[dict[str, Any]],
-    prompt_key: str,
-    reference_key: str,
-) -> tuple[list[dict[str, Any]], str, str | None]:
-    prompt_candidates = ["prompt", "input", "instruction", "question", "text"]
-    reference_candidates = ["reference", "target", "answer", "output", "response"]
-
-    resolved_prompt_key = prompt_key
-    resolved_reference_key = reference_key or None
-
-    if not resolved_prompt_key:
-        for record in records:
-            found = first_present_key(record, prompt_candidates)
-            if found:
-                resolved_prompt_key = found
-                break
-
-    if not resolved_prompt_key:
-        for record in records:
-            parsed = extract_chat_prompt_and_reference(record)
-            if parsed is not None:
-                resolved_prompt_key = "messages"
-                break
-
-    if not resolved_prompt_key:
-        raise ValueError(
-            "Could not infer prompt key. Pass --prompt-key explicitly."
-        )
-
-    if not resolved_reference_key:
-        for record in records:
-            found = first_present_key(record, reference_candidates)
-            if found:
-                resolved_reference_key = found
-                break
-
-    examples = []
-    for i, record in enumerate(records):
-        if resolved_prompt_key == "messages":
-            parsed = extract_chat_prompt_and_reference(record)
-            if parsed is None:
-                continue
-            prompt_messages, inferred_reference = parsed
-            prompt = "\n".join(
-                f"{item['role']}: {item['content']}" for item in prompt_messages
-            )
-            reference = inferred_reference
-            if resolved_reference_key and resolved_reference_key in record:
-                ref_value = record.get(resolved_reference_key)
-                if ref_value is not None:
-                    reference = str(ref_value)
-
-            examples.append(
-                {
-                    "id": i,
-                    "prompt": prompt,
-                    "chat_messages": prompt_messages,
-                    "reference": reference,
-                    "raw": record,
-                }
-            )
-            continue
-
-        if resolved_prompt_key not in record:
-            continue
-        prompt_value = record.get(resolved_prompt_key, "")
-        if prompt_value is None:
-            continue
-        prompt = str(prompt_value)
-        if not prompt.strip():
-            continue
-
-        reference = None
-        if resolved_reference_key and resolved_reference_key in record:
-            ref_value = record.get(resolved_reference_key)
-            if ref_value is not None:
-                reference = str(ref_value)
-
-        examples.append({"id": i, "prompt": prompt, "reference": reference, "raw": record})
-
-    if not examples:
-        raise ValueError(
-            f"No usable examples found with prompt key '{resolved_prompt_key}'."
-        )
-
-    if resolved_prompt_key == "messages" and resolved_reference_key is None:
-        resolved_reference_key = "messages[-1].assistant"
-
-    return examples, resolved_prompt_key, resolved_reference_key
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
+def parse_obj(text: str) -> tuple[dict[str, Any] | None, list[str]]:
+    reasons: list[str] = []
+    t = text.strip()
+    if not t:
+        return None, ["empty_output"]
     try:
-        import torch
-
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-    except Exception:
+        val = json.loads(t)
+        if isinstance(val, str):
+            val = json.loads(val)
+        if isinstance(val, dict):
+            return val, reasons
+        return None, ["non_object_json"]
+    except json.JSONDecodeError:
         pass
+    frag = first_json_obj(t)
+    if frag is None:
+        return None, ["invalid_json"]
+    try:
+        val = json.loads(frag)
+    except json.JSONDecodeError:
+        return None, ["invalid_json"]
+    if not isinstance(val, dict):
+        return None, ["non_object_json"]
+    return val, ["wrapped_json"]
 
 
-def load_tokenizer(model_name_or_path: str, trust_remote_code: bool):
+def infer_schema(examples: list[dict[str, Any]]) -> tuple[list[str], set[str], dict[str, tuple[float, float]], dict[str, set[str]]] | None:
+    refs = []
+    for x in examples:
+        r = x.get("reference")
+        if r is None:
+            continue
+        obj, _ = parse_obj(r)
+        if obj is not None:
+            refs.append(obj)
+    if not refs:
+        return None
+    keys = set(refs[0].keys())
+    for r in refs[1:]:
+        keys &= set(r.keys())
+    if not keys:
+        return None
+    ordered = [k for k in refs[0].keys() if k in keys]
+    numeric: set[str] = set()
+    ranges: dict[str, tuple[float, float]] = {}
+    allowed: dict[str, set[str]] = {}
+    for k in ordered:
+        vals = []
+        ok = True
+        for r in refs:
+            try:
+                vals.append(float(r[k]))
+            except Exception:
+                ok = False
+                break
+        if ok and vals:
+            numeric.add(k)
+            ranges[k] = (min(vals), max(vals))
+        else:
+            allowed[k] = {norm(str(r.get(k))) for r in refs if r.get(k) is not None}
+    return ordered, numeric, ranges, allowed
+
+
+def score_struct(pred: str, ref: str, schema) -> dict[str, Any]:
+    keys, numeric, ranges, allowed = schema
+    ro, _ = parse_obj(ref)
+    po, rs = parse_obj(pred)
+    reasons = set(rs)
+    if ro is None or po is None:
+        return {"accuracy": 0.0, "hallucinated": 1, "a1_score": 0.0, "exact_json_match": 0, "reasons": sorted(reasons)}
+    miss = [k for k in keys if k not in po]
+    extra = [k for k in po.keys() if k not in keys]
+    if miss:
+        reasons.add("missing_keys")
+    if extra:
+        reasons.add("extra_keys")
+    scores = []
+    exact = True
+    for k in keys:
+        if k not in po:
+            scores.append(0.0)
+            exact = False
+            continue
+        if k in numeric:
+            try:
+                pv = float(po[k]); rv = float(ro[k])
+                lo, hi = ranges.get(k, (rv, rv))
+                sc = max(0.0, 1.0 - abs(pv - rv) / max(hi - lo, 1.0))
+            except Exception:
+                sc = 0.0
+                reasons.add(f"non_numeric:{k}")
+            scores.append(sc)
+            if sc < 1.0:
+                exact = False
+        else:
+            p = norm(str(po[k])); r = norm(str(ro[k]))
+            sc = 1.0 if p == r else 0.0
+            scores.append(sc)
+            if sc < 1.0:
+                exact = False
+            if allowed.get(k) and p not in allowed[k]:
+                reasons.add(f"out_of_domain:{k}")
+    acc = statistics.mean(scores) if scores else 0.0
+    hall = int(bool(reasons))
+    a1 = acc * (1 - hall)
+    return {"accuracy": round(acc, 6), "hallucinated": hall, "a1_score": round(a1, 6), "exact_json_match": int(exact and not miss and not extra), "reasons": sorted(reasons)}
+
+
+def load_tokenizer(model_path: str, trust_remote_code: bool):
     from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name_or_path, trust_remote_code=trust_remote_code
-    )
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
+    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    if tok.pad_token is None and tok.eos_token is not None:
+        tok.pad_token = tok.eos_token
+    return tok
 
 
-def load_base_model(model_name_or_path: str, trust_remote_code: bool):
+def load_model(model_path: str, trust_remote_code: bool, load_in_4bit: bool):
     import torch
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+    kw: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    if load_in_4bit:
+        kw["device_map"] = "auto"
+        kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
+    else:
+        dt = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8) else (torch.float16 if torch.cuda.is_available() else torch.float32)
+        kw["dtype"] = dt
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_path, **kw)
+    except TypeError:
+        if "dtype" in kw:
+            kw["torch_dtype"] = kw.pop("dtype")
+            return AutoModelForCausalLM.from_pretrained(model_path, **kw)
+        raise
 
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        trust_remote_code=trust_remote_code,
-        torch_dtype=dtype,
-    )
-    return model
 
-
-def apply_lora(model, adapter_path: str):
+def apply_adapter(model, adapter: str):
     from peft import PeftModel
+    return PeftModel.from_pretrained(model, adapter)
 
-    return PeftModel.from_pretrained(model, adapter_path)
 
-
-def generate_one(
-    model,
-    tokenizer,
-    example: dict[str, Any],
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    device: str,
-) -> tuple[str, float]:
+def eval_model(model, tok, examples: list[dict[str, Any]], schema, args: argparse.Namespace) -> dict[str, Any]:
     import torch
-
-    prompt_text = example["prompt"]
-    chat_messages = example.get("chat_messages")
-    if chat_messages is not None and hasattr(tokenizer, "apply_chat_template"):
-        prompt_text = tokenizer.apply_chat_template(
-            chat_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-    inputs = tokenizer(prompt_text, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    input_len = inputs["input_ids"].shape[1]
-
-    gen_kwargs = {
-        "max_new_tokens": max_new_tokens,
-        "pad_token_id": tokenizer.pad_token_id,
-        "do_sample": temperature > 0.0,
-    }
-    if temperature > 0.0:
-        gen_kwargs["temperature"] = temperature
-        gen_kwargs["top_p"] = top_p
-
-    start = time.perf_counter()
-    with torch.no_grad():
-        output_ids = model.generate(**inputs, **gen_kwargs)
-    elapsed = time.perf_counter() - start
-
-    completion_ids = output_ids[0][input_len:]
-    completion = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
-    return completion, elapsed
-
-
-def evaluate_model(
-    model,
-    tokenizer,
-    examples: list[dict[str, Any]],
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-) -> dict[str, Any]:
-    import torch
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
+    quant = bool(getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False))
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    if not quant:
+        model.to(dev)
     model.eval()
 
-    results = []
-    latencies = []
-    em_scores = []
-    f1_scores = []
+    if args.temperature <= 0.0 and hasattr(model, "generation_config"):
+        for key in ("temperature", "top_p", "top_k"):
+            if hasattr(model.generation_config, key):
+                setattr(model.generation_config, key, None)
+    rows = []
+    lats: list[float] = []
+    ems: list[int] = []
+    f1s: list[float] = []
+    accs: list[float] = []
+    halls: list[int] = []
+    a1s: list[float] = []
+    exjson: list[int] = []
+    rc: dict[str, int] = {}
+    for x in examples:
+        prompt = x["prompt"]
+        if x.get("messages") is not None and hasattr(tok, "apply_chat_template"):
+            prompt = tok.apply_chat_template(x["messages"], tokenize=False, add_generation_prompt=True)
+        ins = tok(prompt, return_tensors="pt")
+        ins = {k: v.to(dev) for k, v in ins.items()}
+        n = ins["input_ids"].shape[1]
+        gkw = {"max_new_tokens": args.max_new_tokens, "pad_token_id": tok.pad_token_id, "do_sample": args.temperature > 0.0}
+        if args.temperature > 0.0:
+            gkw["temperature"] = args.temperature
+            gkw["top_p"] = args.top_p
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            out = model.generate(**ins, **gkw)
+        dt = time.perf_counter() - t0
+        pred = tok.decode(out[0][n:], skip_special_tokens=True).strip()
+        row: dict[str, Any] = {"id": x["id"], "prompt": x["prompt"], "prediction": pred, "latency_sec": round(dt, 6)}
+        lats.append(dt)
+        ref = x.get("reference")
+        if ref is not None:
+            row["reference"] = ref
+            em = int(norm(pred) == norm(ref)); f1 = token_f1(pred, ref)
+            row["exact_match"] = em; row["token_f1"] = round(f1, 6)
+            ems.append(em); f1s.append(f1)
+            if schema is not None:
+                s = score_struct(pred, ref, schema)
+                row.update(s)
+                accs.append(s["accuracy"]); halls.append(s["hallucinated"]); a1s.append(s["a1_score"]); exjson.append(s["exact_json_match"])
+                row["hallucination_reasons"] = s["reasons"]
+                for r in s["reasons"]:
+                    rc[r] = rc.get(r, 0) + 1
+        rows.append(row)
+    summ: dict[str, Any] = {"num_examples": len(rows), "avg_latency_sec": round(statistics.mean(lats), 4) if lats else None, "median_latency_sec": round(statistics.median(lats), 4) if lats else None}
+    if ems:
+        summ["exact_match"] = round(sum(ems) / len(ems), 4); summ["token_f1"] = round(sum(f1s) / len(f1s), 4)
+    if accs:
+        summ["accuracy"] = round(statistics.mean(accs), 4); summ["hallucination_rate"] = round(statistics.mean(halls), 4); summ["a1_score"] = round(statistics.mean(a1s), 4)
+        summ["exact_json_match"] = round(statistics.mean(exjson), 4); summ["hallucination_reason_counts"] = dict(sorted(rc.items()))
+    return {"summary": summ, "predictions": rows}
 
-    for ex in examples:
-        prediction, latency = generate_one(
-            model=model,
-            tokenizer=tokenizer,
-            example=ex,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            device=device,
-        )
-        latencies.append(latency)
-        item = {
-            "id": ex["id"],
-            "prompt": ex["prompt"],
-            "prediction": prediction,
-            "latency_sec": latency,
-        }
 
-        reference = ex.get("reference")
-        if reference is not None:
-            em = int(normalize_text(prediction) == normalize_text(reference))
-            f1 = token_f1(prediction, reference)
-            item["reference"] = reference
-            item["exact_match"] = em
-            item["token_f1"] = f1
-            em_scores.append(em)
-            f1_scores.append(f1)
-
-        results.append(item)
-
-    summary = {
-        "num_examples": len(results),
-        "avg_latency_sec": round(statistics.mean(latencies), 4) if latencies else None,
-        "median_latency_sec": round(statistics.median(latencies), 4) if latencies else None,
-    }
-    if em_scores:
-        summary["exact_match"] = round(sum(em_scores) / len(em_scores), 4)
-        summary["token_f1"] = round(sum(f1_scores) / len(f1_scores), 4)
-
-    return {"summary": summary, "predictions": results}
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False))
-            f.write("\n")
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def main() -> None:
-    args = parse_args()
-    project_root = ensure_llm_finetuning_project()
-    set_seed(args.seed)
+    a = args_parser()
+    random.seed(a.seed)
+    dataset = resolve(a.dataset)
+    rows = load_records(dataset)
+    ex = extract_examples(rows)
+    if a.shuffle:
+        random.shuffle(ex)
+    if a.max_samples > 0:
+        ex = ex[: a.max_samples]
+    if not ex:
+        raise SystemExit("No usable examples found in dataset.")
 
-    try:
-        import torch  # noqa: F401
-        import transformers  # noqa: F401
-        import peft  # noqa: F401
-    except Exception as exc:
-        raise SystemExit(
-            "Missing dependencies. Install: pip install torch transformers peft"
-        ) from exc
+    tok = load_tokenizer(a.base_model, a.trust_remote_code)
+    schema = infer_schema(ex)
+    labels = [("base", None), ("lora", a.lora_adapter), ("qlora", a.qlora_adapter)]
+    out: dict[str, dict[str, Any]] = {}
+    for label, adapter in labels:
+        m = load_model(a.base_model, a.trust_remote_code, a.load_in_4bit)
+        if adapter is not None:
+            m = apply_adapter(m, adapter)
+        out[label] = eval_model(m, tok, ex, schema, a)
+        try:
+            import torch
+            del m
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
-    dataset_path = resolve_project_path(args.dataset, project_root)
-    records = load_records(dataset_path)
-    examples, prompt_key, reference_key = extract_examples(
-        records=records,
-        prompt_key=args.prompt_key,
-        reference_key=args.reference_key,
-    )
-
-    if args.shuffle:
-        random.shuffle(examples)
-    if args.max_samples > 0:
-        examples = examples[: args.max_samples]
-
-    tokenizer = load_tokenizer(args.base_model, trust_remote_code=args.trust_remote_code)
-
-    # Evaluate base model first.
-    base_model = load_base_model(args.base_model, trust_remote_code=args.trust_remote_code)
-    base_eval = evaluate_model(
-        model=base_model,
-        tokenizer=tokenizer,
-        examples=examples,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-    )
-
-    # Free memory before loading LoRA variant.
-    try:
-        import torch
-
-        del base_model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-    lora_base = load_base_model(args.base_model, trust_remote_code=args.trust_remote_code)
-    lora_model = apply_lora(lora_base, args.lora_adapter)
-    lora_eval = evaluate_model(
-        model=lora_model,
-        tokenizer=tokenizer,
-        examples=examples,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-    )
-
+    base = out["base"]["summary"]; lora = out["lora"]["summary"]; qlora = out["qlora"]["summary"]
     report = {
-        "config": {
-            "base_model": args.base_model,
-            "lora_adapter": args.lora_adapter,
-            "dataset": str(dataset_path),
-            "prompt_key": prompt_key,
-            "reference_key": reference_key,
-            "max_samples": args.max_samples,
-            "max_new_tokens": args.max_new_tokens,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "seed": args.seed,
+        "config": {"base_model": a.base_model, "lora_adapter": a.lora_adapter, "qlora_adapter": a.qlora_adapter, "dataset": str(dataset), "max_samples": a.max_samples, "max_new_tokens": a.max_new_tokens, "temperature": a.temperature, "top_p": a.top_p, "seed": a.seed, "load_in_4bit": a.load_in_4bit},
+        "metric_definitions": {"accuracy": "Mean per-field score against reference JSON.", "hallucination_rate": "Fraction with format/schema violations.", "a1_score": "Mean(accuracy * (1 - hallucinated))."},
+        "models": {"base": base, "lora": lora, "qlora": qlora},
+        "comparisons_vs_base": {
+            "lora": {k: (round(lora[k] - base[k], 4) if isinstance(lora.get(k), (int, float)) and isinstance(base.get(k), (int, float)) else None) for k in ("accuracy", "hallucination_rate", "a1_score", "exact_match", "token_f1")},
+            "qlora": {k: (round(qlora[k] - base[k], 4) if isinstance(qlora.get(k), (int, float)) and isinstance(base.get(k), (int, float)) else None) for k in ("accuracy", "hallucination_rate", "a1_score", "exact_match", "token_f1")},
         },
-        "base_model": base_eval["summary"],
-        "base_plus_lora": lora_eval["summary"],
     }
+    rep_path = resolve(a.output_report)
+    write_json(rep_path, report)
 
-    output_report_path = resolve_project_path(args.output_report, project_root)
-    write_json(output_report_path, report)
+    if a.output_predictions:
+        pred_path = resolve(a.output_predictions)
+        merged = []
+        for b, l, q in zip(out["base"]["predictions"], out["lora"]["predictions"], out["qlora"]["predictions"]):
+            row = {"id": b["id"], "prompt": b["prompt"], "reference": b.get("reference"), "base_prediction": b["prediction"], "lora_prediction": l["prediction"], "qlora_prediction": q["prediction"], "base_latency_sec": b["latency_sec"], "lora_latency_sec": l["latency_sec"], "qlora_latency_sec": q["latency_sec"]}
+            for pfx, src in (("base", b), ("lora", l), ("qlora", q)):
+                for k in ("exact_match", "token_f1", "accuracy", "hallucinated", "a1_score", "exact_json_match"):
+                    if k in src:
+                        row[f"{pfx}_{k}"] = src[k]
+                if "hallucination_reasons" in src:
+                    row[f"{pfx}_hallucination_reasons"] = src["hallucination_reasons"]
+            merged.append(row)
+        write_jsonl(pred_path, merged)
+        print(f"Wrote per-sample predictions to: {pred_path}")
 
-    if args.output_predictions:
-        output_predictions_path = resolve_project_path(args.output_predictions, project_root)
-        combined_rows = []
-        for base_row, lora_row in zip(base_eval["predictions"], lora_eval["predictions"]):
-            row = {
-                "id": base_row["id"],
-                "prompt": base_row["prompt"],
-                "reference": base_row.get("reference"),
-                "base_prediction": base_row["prediction"],
-                "lora_prediction": lora_row["prediction"],
-                "base_latency_sec": base_row["latency_sec"],
-                "lora_latency_sec": lora_row["latency_sec"],
-            }
-            if "exact_match" in base_row:
-                row["base_exact_match"] = base_row["exact_match"]
-                row["lora_exact_match"] = lora_row.get("exact_match")
-                row["base_token_f1"] = base_row.get("token_f1")
-                row["lora_token_f1"] = lora_row.get("token_f1")
-            combined_rows.append(row)
-        write_jsonl(output_predictions_path, combined_rows)
-
-    print("\n=== Evaluation Complete ===")
     print(json.dumps(report, indent=2))
-    if args.output_predictions:
-        print(f"\nWrote per-sample predictions to: {output_predictions_path}")
-    print(f"Wrote summary report to: {output_report_path}")
+    print(f"Wrote summary report to: {rep_path}")
 
 
 if __name__ == "__main__":
