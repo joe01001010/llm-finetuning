@@ -119,7 +119,7 @@ Output:
 - `lora`: non-quantized base model loading
 
 ### Train QLoRA
-- `Training Time: 1 Hour 17 Minutes`
+- `Training Time: 50 Minutes 10 Seconds`
 
 ```bash
 cd /llm-finetuning
@@ -132,7 +132,7 @@ python python/train_model.py \
 ```
 
 ### Train LoRA
-- `Training Time: 2 Hour 54 Minutes`
+- `Training Time: 1 Hour 12 Minutes`
 
 ```bash
 cd /llm-finetuning

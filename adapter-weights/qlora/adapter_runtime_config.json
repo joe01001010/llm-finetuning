@@ -1,0 +1,6 @@
+{
+  "adapter_mode": "qlora",
+  "base_model_load_mode": "4bit",
+  "compute_dtype": "bfloat16",
+  "note": "QLoRA uses 4-bit base-model loading. PEFT saves adapter deltas separately, so adapter file size stays similar."
+}
