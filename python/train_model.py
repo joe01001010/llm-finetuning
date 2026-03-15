@@ -18,6 +18,7 @@ import torch
 from datasets import load_dataset
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer, create_reference_model
 
@@ -364,6 +365,7 @@ def train_with_ppo(
         tokenizer,
     )
     prompt_dataloader = build_prompt_dataloader(dataset, args.batch_size)
+    total_steps = len(prompt_dataloader) * args.num_train_epochs
 
     device = get_policy_device(policy_model)
     generation_kwargs = build_generation_kwargs(tokenizer, args)
@@ -375,75 +377,94 @@ def train_with_ppo(
     ppo_stats: dict[str, list[float]] = defaultdict(list)
     global_step = 0
 
-    for epoch in range(args.num_train_epochs):
-        print(f"Starting PPO epoch {epoch + 1}/{args.num_train_epochs}")
-        for batch in prompt_dataloader:
-            global_step += 1
-            query_tensors = [query_tensor.to(device) for query_tensor in batch["input_ids"]]
-            response_tensors, response_texts = generate_responses_sequentially(
-                ppo_trainer=ppo_trainer,
-                query_tensors=query_tensors,
-                tokenizer=tokenizer,
-                generation_kwargs=generation_kwargs,
-            )
-
-            rewards = []
-            batch_rewards = []
-            batch_accuracies = []
-            batch_a1_scores = []
-            for response_text, reference_text in zip(response_texts, batch["reference"]):
-                reward_value, breakdown = reward_from_prediction(response_text, reference_text, schema)
-                rewards.append(torch.tensor(reward_value, device=device))
-                batch_rewards.append(reward_value)
-                batch_accuracies.append(float(breakdown["accuracy"]))
-                batch_a1_scores.append(float(breakdown["a1_score"]))
-                reward_history.append(reward_value)
-                accuracy_history.append(float(breakdown["accuracy"]))
-                a1_history.append(float(breakdown["a1_score"]))
-                exact_json_history.append(float(breakdown["exact_json_match"]))
-                for reason in breakdown["reasons"]:
-                    reward_reason_counts[reason] += 1
-
-            step_stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
-            for key, value in step_stats.items():
-                if isinstance(value, (int, float)):
-                    ppo_stats[key].append(float(value))
-
-            del query_tensors
-            del response_tensors
-            del response_texts
-            del rewards
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            if global_step % args.logging_steps == 0:
-                print(
-                    f"PPO step {global_step}: "
-                    f"avg_reward={sum(batch_rewards) / len(batch_rewards):.4f}, "
-                    f"avg_accuracy={sum(batch_accuracies) / len(batch_accuracies):.4f}, "
-                    f"avg_a1={sum(batch_a1_scores) / len(batch_a1_scores):.4f}"
+    with tqdm(total=total_steps, desc="PPO training", dynamic_ncols=True) as progress_bar:
+        for epoch in range(args.num_train_epochs):
+            progress_bar.set_description(f"PPO epoch {epoch + 1}/{args.num_train_epochs}")
+            for batch in prompt_dataloader:
+                global_step += 1
+                query_tensors = [query_tensor.to(device) for query_tensor in batch["input_ids"]]
+                response_tensors, response_texts = generate_responses_sequentially(
+                    ppo_trainer=ppo_trainer,
+                    query_tensors=query_tensors,
+                    tokenizer=tokenizer,
+                    generation_kwargs=generation_kwargs,
                 )
 
-            if args.save_steps > 0 and global_step % args.save_steps == 0:
-                checkpoint_dir = output_dir / f"checkpoint-{global_step}"
-                checkpoint_summary = {
-                    "global_step": global_step,
-                    "avg_reward": mean_or_none(reward_history),
-                    "avg_accuracy": mean_or_none(accuracy_history),
-                    "avg_a1_score": mean_or_none(a1_history),
-                    "avg_exact_json_match": mean_or_none(exact_json_history),
-                    "reason_counts": dict(sorted(reward_reason_counts.items())),
-                }
-                save_policy_artifacts(
-                    policy_model,
-                    tokenizer,
-                    checkpoint_dir,
-                    mode,
-                    base_model_load_mode,
-                    compute_dtype,
-                    args,
-                    checkpoint_summary,
+                rewards = []
+                batch_rewards = []
+                batch_accuracies = []
+                batch_a1_scores = []
+                for response_text, reference_text in zip(response_texts, batch["reference"]):
+                    reward_value, breakdown = reward_from_prediction(response_text, reference_text, schema)
+                    rewards.append(torch.tensor(reward_value, device=device))
+                    batch_rewards.append(reward_value)
+                    batch_accuracies.append(float(breakdown["accuracy"]))
+                    batch_a1_scores.append(float(breakdown["a1_score"]))
+                    reward_history.append(reward_value)
+                    accuracy_history.append(float(breakdown["accuracy"]))
+                    a1_history.append(float(breakdown["a1_score"]))
+                    exact_json_history.append(float(breakdown["exact_json_match"]))
+                    for reason in breakdown["reasons"]:
+                        reward_reason_counts[reason] += 1
+
+                step_stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
+                for key, value in step_stats.items():
+                    if isinstance(value, (int, float)):
+                        ppo_stats[key].append(float(value))
+
+                step_reward = sum(batch_rewards) / len(batch_rewards)
+                step_accuracy = sum(batch_accuracies) / len(batch_accuracies)
+                step_a1 = sum(batch_a1_scores) / len(batch_a1_scores)
+                running_reward = sum(reward_history) / len(reward_history)
+                running_accuracy = sum(accuracy_history) / len(accuracy_history)
+
+                progress_bar.update(1)
+                progress_bar.set_postfix(
+                    step_reward=f"{step_reward:.4f}",
+                    step_acc=f"{step_accuracy:.4f}",
+                    step_a1=f"{step_a1:.4f}",
+                    avg_reward=f"{running_reward:.4f}",
+                    avg_acc=f"{running_accuracy:.4f}",
                 )
+
+                del query_tensors
+                del response_tensors
+                del response_texts
+                del rewards
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                if global_step % args.logging_steps == 0:
+                    progress_bar.write(
+                        f"PPO step {global_step}/{total_steps}: "
+                        f"step_reward={step_reward:.4f}, "
+                        f"step_accuracy={step_accuracy:.4f}, "
+                        f"step_a1={step_a1:.4f}, "
+                        f"avg_reward={running_reward:.4f}, "
+                        f"avg_accuracy={running_accuracy:.4f}"
+                    )
+
+                if args.save_steps > 0 and global_step % args.save_steps == 0:
+                    checkpoint_dir = output_dir / f"checkpoint-{global_step}"
+                    checkpoint_summary = {
+                        "global_step": global_step,
+                        "avg_reward": mean_or_none(reward_history),
+                        "avg_accuracy": mean_or_none(accuracy_history),
+                        "avg_a1_score": mean_or_none(a1_history),
+                        "avg_exact_json_match": mean_or_none(exact_json_history),
+                        "reason_counts": dict(sorted(reward_reason_counts.items())),
+                    }
+                    save_policy_artifacts(
+                        policy_model,
+                        tokenizer,
+                        checkpoint_dir,
+                        mode,
+                        base_model_load_mode,
+                        compute_dtype,
+                        args,
+                        checkpoint_summary,
+                    )
+                    progress_bar.write(f"Saved checkpoint to {checkpoint_dir}")
 
     summary = {
         "training_algorithm": "ppo",
