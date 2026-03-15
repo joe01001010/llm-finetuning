@@ -48,7 +48,6 @@ nvidia-nccl-cu12
 nvidia-nvjitlink-cu12
 nvidia-nvshmem-cu12
 nvidia-nvtx-cu12
-packaging
 pandas
 peft
 propcache
@@ -70,11 +69,11 @@ tokenizers
 torch
 tqdm
 transformers
-trl==0.11.4
 triton
+trl
 typer
-typer-slim
 typing_extensions
 urllib3
+wheel
 xxhash
 yarl
