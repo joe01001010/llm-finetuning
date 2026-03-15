@@ -42,17 +42,17 @@ def parse_args():
         help="Adapter output directory. Defaults to ./adapter-weights/<mode>.",
     )
     parser.add_argument("--num-train-epochs", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--mini-batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--mini-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument("--ppo-epochs", type=int, default=2)
     parser.add_argument("--init-kl-coef", type=float, default=0.2)
     parser.add_argument("--save-steps", type=int, default=100)
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max-prompt-length", type=int, default=768)
-    parser.add_argument("--max-new-tokens", type=int, default=96)
+    parser.add_argument("--max-prompt-length", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
     return parser.parse_args()
@@ -237,6 +237,31 @@ def build_generation_kwargs(tokenizer, args: argparse.Namespace) -> dict[str, An
     }
 
 
+def generate_responses_sequentially(ppo_trainer, query_tensors, tokenizer, generation_kwargs):
+    """
+    Generating one sample at a time reduces peak memory during rollout.
+    """
+    response_tensors = []
+    response_texts = []
+
+    for query_tensor in query_tensors:
+        response = ppo_trainer.generate(
+            query_tensor.unsqueeze(0),
+            return_prompt=False,
+            **generation_kwargs,
+        )
+        if isinstance(response, torch.Tensor):
+            response_tensor = response[0]
+        else:
+            response_tensor = response[0]
+        response_tensors.append(response_tensor)
+        response_texts.append(
+            tokenizer.decode(response_tensor.squeeze(), skip_special_tokens=True).strip()
+        )
+
+    return response_tensors, response_texts
+
+
 def write_runtime_config(output_dir: Path, mode: str, base_model_load_mode: str, compute_dtype, args: argparse.Namespace) -> None:
     runtime_config = {
         "training_algorithm": "ppo",
@@ -297,12 +322,14 @@ def train_with_ppo(
         model_name=args.model_path,
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
+        forward_batch_size=1,
         mini_batch_size=args.mini_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         ppo_epochs=args.ppo_epochs,
         init_kl_coef=args.init_kl_coef,
         seed=args.seed,
         log_with=None,
+        optimize_device_cache=True,
     )
     ppo_trainer = PPOTrainer(
         ppo_config,
@@ -327,18 +354,12 @@ def train_with_ppo(
         for batch in prompt_dataloader:
             global_step += 1
             query_tensors = [query_tensor.to(device) for query_tensor in batch["input_ids"]]
-            response_tensors = ppo_trainer.generate(
-                query_tensors,
-                return_prompt=False,
-                **generation_kwargs,
+            response_tensors, response_texts = generate_responses_sequentially(
+                ppo_trainer=ppo_trainer,
+                query_tensors=query_tensors,
+                tokenizer=tokenizer,
+                generation_kwargs=generation_kwargs,
             )
-            if isinstance(response_tensors, torch.Tensor):
-                response_tensors = [response for response in response_tensors]
-
-            response_texts = [
-                tokenizer.decode(response_tensor.squeeze(), skip_special_tokens=True).strip()
-                for response_tensor in response_tensors
-            ]
 
             rewards = []
             batch_rewards = []
@@ -361,6 +382,13 @@ def train_with_ppo(
             for key, value in step_stats.items():
                 if isinstance(value, (int, float)):
                     ppo_stats[key].append(float(value))
+
+            del query_tensors
+            del response_tensors
+            del response_texts
+            del rewards
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             if global_step % args.logging_steps == 0:
                 print(

@@ -137,9 +137,10 @@ python python/train_model.py \
   --data-path /llm-finetuning/data/seattle_weather_chat_train.jsonl \
   --output-dir /llm-finetuning/adapter-weights/qlora \
   --num-train-epochs 1 \
-  --batch-size 8 \
-  --mini-batch-size 2 \
-  --max-new-tokens 96
+  --batch-size 1 \
+  --mini-batch-size 1 \
+  --max-prompt-length 512 \
+  --max-new-tokens 48
 ```
 
 ### Train LoRA with PPO
@@ -152,9 +153,10 @@ python python/train_model.py \
   --data-path /llm-finetuning/data/seattle_weather_chat_train.jsonl \
   --output-dir /llm-finetuning/adapter-weights/lora \
   --num-train-epochs 1 \
-  --batch-size 8 \
-  --mini-batch-size 2 \
-  --max-new-tokens 96
+  --batch-size 1 \
+  --mini-batch-size 1 \
+  --max-prompt-length 512 \
+  --max-new-tokens 48
 ```
 
 Common tunables:
