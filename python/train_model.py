@@ -17,6 +17,7 @@ from typing import Any
 import torch
 from datasets import load_dataset
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer, create_reference_model
 
@@ -206,6 +207,19 @@ def collate_prompt_batch(features):
     }
 
 
+def build_prompt_dataloader(dataset, batch_size: int):
+    """
+    TRL's internal dataloader drops non-model columns, so we keep our own
+    prompt/reference loader and use PPOTrainer only for rollout + PPO updates.
+    """
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_prompt_batch,
+    )
+
+
 def get_policy_device(model) -> torch.device:
     for parameter in model.parameters():
         return parameter.device
@@ -295,9 +309,8 @@ def train_with_ppo(
         policy_model,
         ref_model,
         tokenizer,
-        dataset=dataset,
-        data_collator=collate_prompt_batch,
     )
+    prompt_dataloader = build_prompt_dataloader(dataset, args.batch_size)
 
     device = get_policy_device(policy_model)
     generation_kwargs = build_generation_kwargs(tokenizer, args)
@@ -311,7 +324,7 @@ def train_with_ppo(
 
     for epoch in range(args.num_train_epochs):
         print(f"Starting PPO epoch {epoch + 1}/{args.num_train_epochs}")
-        for batch in ppo_trainer.dataloader:
+        for batch in prompt_dataloader:
             global_step += 1
             query_tensors = [query_tensor.to(device) for query_tensor in batch["input_ids"]]
             response_tensors = ppo_trainer.generate(
