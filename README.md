@@ -3,7 +3,7 @@
 End-to-end local workflow for:
 - pulling a base LLM into a container-mounted path
 - preparing a weather prediction chat dataset
-- training adapters with `LoRA` and `QLoRA`
+- training adapters with PPO using `LoRA` and `QLoRA`
 - evaluating base model vs adapter model outputs
 
 ## Project Capabilities
@@ -11,9 +11,12 @@ End-to-end local workflow for:
 - Containerized GPU workflow using `nvcr.io/nvidia/pytorch:25.04-py3`
 - Base model pull from Hugging Face (`Qwen/Qwen2-7B-Instruct`)
 - Dataset pull + formatting from Kaggle into chat fine-tuning JSONL
-- Adapter training with:
-  - `LoRA` (full-precision base model loading)
-  - `QLoRA` (4-bit quantized base model loading)
+- PPO-based adapter training with:
+  - prompt-only rollouts
+  - structured rewards computed against the target JSON
+  - KL control against a frozen reference model
+  - `LoRA` (16-bit base model loading)
+  - `QLoRA` (4-bit base model loading)
 - Side-by-side evaluation of base vs base+adapter with latency and optional EM/F1
 
 ## Repository Layout
@@ -21,7 +24,7 @@ End-to-end local workflow for:
 - `containers/setup_container.sh`: installs Docker + NVIDIA container toolkit and pulls the base image.
 - `python/pull_model.py`: downloads the base model to `/local-containers/Qwen2-7B-Instruct`.
 - `python/data_formatting.py`: pulls weather dataset from Kaggle and writes combined, train, and eval chat datasets under `data/`.
-- `python/train_model.py`: trains adapter weights (`--mode lora` or `--mode qlora`).
+- `python/train_model.py`: trains PPO adapters (`--mode lora` or `--mode qlora`).
 - `python/evaluate_models.py`: compares base vs LoRA vs QLoRA in one run.
 - `adapter-weights/`: default adapter output location.
 
@@ -112,14 +115,19 @@ Output:
 - `/llm-finetuning/data/seattle_weather_chat_eval.jsonl`
 - `/llm-finetuning/data/seattle_weather_chat.json` (legacy combined output)
 
-## 6) Train Adapters
+## 6) Train PPO Adapters
 
-`train_model.py` supports both modes:
-- `qlora`: 4-bit quantized base model loading (`BitsAndBytesConfig`)
-- `lora`: non-quantized base model loading
+`train_model.py` now uses PPO as the core training algorithm:
+- input to the policy is prompt-only chat context
+- the model samples a response
+- the response is scored against the ground-truth weather JSON
+- PPO updates the policy while a frozen reference model supplies KL control
 
-### Train QLoRA
-- `Training Time: 50 Minutes 10 Seconds`
+Modes:
+- `qlora`: 4-bit quantized base model with trainable LoRA adapters
+- `lora`: 16-bit base model with trainable LoRA adapters
+
+### Train QLoRA with PPO
 
 ```bash
 cd /llm-finetuning
@@ -128,11 +136,13 @@ python python/train_model.py \
   --model-path /local-containers/Qwen2-7B-Instruct \
   --data-path /llm-finetuning/data/seattle_weather_chat_train.jsonl \
   --output-dir /llm-finetuning/adapter-weights/qlora \
-  --num-train-epochs 1
+  --num-train-epochs 1 \
+  --batch-size 8 \
+  --mini-batch-size 2 \
+  --max-new-tokens 96
 ```
 
-### Train LoRA
-- `Training Time: 1 Hour 12 Minutes`
+### Train LoRA with PPO
 
 ```bash
 cd /llm-finetuning
@@ -142,16 +152,26 @@ python python/train_model.py \
   --data-path /llm-finetuning/data/seattle_weather_chat_train.jsonl \
   --output-dir /llm-finetuning/adapter-weights/lora \
   --num-train-epochs 1 \
-  --max-length 512 \
-  --per-device-train-batch-size 1 \
-  --gradient-accumulation-steps 16
+  --batch-size 8 \
+  --mini-batch-size 2 \
+  --max-new-tokens 96
 ```
 
 Common tunables:
-- `--per-device-train-batch-size`
+- `--batch-size`
+- `--mini-batch-size`
 - `--gradient-accumulation-steps`
 - `--learning-rate`
-- `--max-length`
+- `--max-prompt-length`
+- `--max-new-tokens`
+- `--ppo-epochs`
+- `--init-kl-coef`
+
+Training artifacts:
+- adapter weights and tokenizer files
+- `adapter_runtime_config.json`
+- `ppo_value_head.pt`
+- `ppo_training_summary.json`
 
 ## 7) Evaluate Base vs LoRA vs QLoRA
 
@@ -196,4 +216,4 @@ python python/evaluate_models.py ... --base-load-mode 4bit
 - `GPU is unavailable`: confirm container has GPU access (`--gpus all`) and host NVIDIA runtime is installed.
 - `kagglehub` auth errors: configure Kaggle credentials before running `data_formatting.py`.
 - model not found at `/local-containers/...`: run `python python/pull_model.py`.
-- out-of-memory: reduce batch size, increase gradient accumulation, reduce `--max-length`, or use `--mode qlora`.
+- out-of-memory: reduce `--batch-size`, `--mini-batch-size`, or `--max-new-tokens`, or use `--mode qlora`.
