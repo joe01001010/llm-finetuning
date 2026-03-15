@@ -246,7 +246,7 @@ def generate_responses_sequentially(ppo_trainer, query_tensors, tokenizer, gener
 
     for query_tensor in query_tensors:
         response = ppo_trainer.generate(
-            query_tensor,
+            [query_tensor],
             return_prompt=False,
             **generation_kwargs,
         )
