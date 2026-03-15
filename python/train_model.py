@@ -246,14 +246,16 @@ def generate_responses_sequentially(ppo_trainer, query_tensors, tokenizer, gener
 
     for query_tensor in query_tensors:
         response = ppo_trainer.generate(
-            query_tensor.unsqueeze(0),
+            query_tensor,
             return_prompt=False,
             **generation_kwargs,
         )
         if isinstance(response, torch.Tensor):
+            response_tensor = response if response.dim() == 1 else response[0]
+        elif isinstance(response, list):
             response_tensor = response[0]
         else:
-            response_tensor = response[0]
+            raise TypeError(f"Unsupported response type from PPO generate: {type(response)!r}")
         response_tensors.append(response_tensor)
         response_texts.append(
             tokenizer.decode(response_tensor.squeeze(), skip_special_tokens=True).strip()
@@ -322,7 +324,6 @@ def train_with_ppo(
         model_name=args.model_path,
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
-        forward_batch_size=1,
         mini_batch_size=args.mini_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         ppo_epochs=args.ppo_epochs,
