@@ -132,6 +132,23 @@ def create_backbone(mode: str, model_path: str, compute_dtype):
     return backbone, base_model_load_mode
 
 
+def enable_model_input_grads(model) -> None:
+    """
+    Gradient checkpointing with LoRA often needs the input embeddings to require
+    grads explicitly after wrappers are added.
+    """
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+        return
+
+    input_embeddings = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+    if input_embeddings is not None:
+        def make_inputs_require_grad(module, inputs, output):
+            output.requires_grad_(True)
+
+        input_embeddings.register_forward_hook(make_inputs_require_grad)
+
+
 def create_policy_and_reference(mode: str, model_path: str):
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     if tokenizer.pad_token is None:
@@ -140,7 +157,15 @@ def create_policy_and_reference(mode: str, model_path: str):
     compute_dtype = get_16bit_dtype()
     backbone, base_model_load_mode = create_backbone(mode, model_path, compute_dtype)
     policy_model = AutoModelForCausalLMWithValueHead.from_pretrained(backbone)
+    if hasattr(policy_model.pretrained_model, "config"):
+        policy_model.pretrained_model.config.use_cache = False
+    if hasattr(policy_model.pretrained_model, "gradient_checkpointing_enable"):
+        policy_model.pretrained_model.gradient_checkpointing_enable()
+    enable_model_input_grads(policy_model.pretrained_model)
+
     ref_model = create_reference_model(policy_model)
+    if hasattr(ref_model.pretrained_model, "config"):
+        ref_model.pretrained_model.config.use_cache = False
 
     if torch.cuda.is_available():
         print("GPU:", torch.cuda.get_device_name(0))
