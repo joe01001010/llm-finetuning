@@ -20,10 +20,10 @@ End-to-end local workflow for:
 
 - `containers/setup_container.sh`: installs Docker + NVIDIA container toolkit and pulls the base image.
 - `python/pull_model.py`: downloads the base model to `/local-containers/Qwen2-7B-Instruct`.
-- `python/data_formatting.py`: pulls weather dataset from Kaggle and writes `data/seattle_weather_chat.json`.
+- `python/data_formatting.py`: pulls weather dataset from Kaggle and writes combined, train, and eval chat datasets under `data/`.
 - `python/train_model.py`: trains adapter weights (`--mode lora` or `--mode qlora`).
 - `python/evaluate_models.py`: compares base vs LoRA vs QLoRA in one run.
-- `lora-weights/`: default adapter output location.
+- `adapter-weights/`: default adapter output location.
 
 ## Prerequisites
 
@@ -107,7 +107,10 @@ python python/data_formatting.py
 ```
 
 Output:
-- `/llm-finetuning/data/seattle_weather_chat.json`
+- `/llm-finetuning/data/seattle_weather_chat.jsonl`
+- `/llm-finetuning/data/seattle_weather_chat_train.jsonl`
+- `/llm-finetuning/data/seattle_weather_chat_eval.jsonl`
+- `/llm-finetuning/data/seattle_weather_chat.json` (legacy combined output)
 
 ## 6) Train Adapters
 
@@ -116,28 +119,28 @@ Output:
 - `lora`: non-quantized base model loading
 
 ### Train QLoRA
-- `Training Time: 1 Hour 17 Minutes`
+- `Training Time: 50 Minutes 10 Seconds`
 
 ```bash
 cd /llm-finetuning
 python python/train_model.py \
   --mode qlora \
   --model-path /local-containers/Qwen2-7B-Instruct \
-  --data-path /llm-finetuning/data/seattle_weather_chat.json \
-  --output-dir /llm-finetuning/lora-weights/qlora \
+  --data-path /llm-finetuning/data/seattle_weather_chat_train.jsonl \
+  --output-dir /llm-finetuning/adapter-weights/qlora \
   --num-train-epochs 1
 ```
 
 ### Train LoRA
-- `Training Time: 2 Hour 54 Minutes`
+- `Training Time: 1 Hour 12 Minutes`
 
 ```bash
 cd /llm-finetuning
 python python/train_model.py \
   --mode lora \
   --model-path /local-containers/Qwen2-7B-Instruct \
-  --data-path /llm-finetuning/data/seattle_weather_chat.json \
-  --output-dir /llm-finetuning/lora-weights/lora \
+  --data-path /llm-finetuning/data/seattle_weather_chat_train.jsonl \
+  --output-dir /llm-finetuning/adapter-weights/lora \
   --num-train-epochs 1 \
   --max-length 512 \
   --per-device-train-batch-size 1 \
@@ -169,18 +172,23 @@ mkdir -p /llm-finetuning/reports
 cd /llm-finetuning
 python python/evaluate_models.py \
   --base-model /local-containers/Qwen2-7B-Instruct \
-  --lora-adapter /llm-finetuning/lora-weights/lora \
-  --qlora-adapter /llm-finetuning/lora-weights/qlora \
-  --dataset /llm-finetuning/data/seattle_weather_chat.json \
+  --lora-adapter /llm-finetuning/adapter-weights/lora \
+  --qlora-adapter /llm-finetuning/adapter-weights/qlora \
+  --dataset /llm-finetuning/data/seattle_weather_chat_eval.jsonl \
   --output-report /llm-finetuning/reports/base_lora_qlora.json \
   --output-predictions /llm-finetuning/reports/base_lora_qlora_predictions.jsonl \
   --max-samples 200
 ```
 
-Optional for lower VRAM:
+By default evaluation now loads:
+- base in 16-bit
+- LoRA with a 16-bit base model
+- QLoRA with a 4-bit base model
+
+Optional for lower VRAM on the baseline model only:
 
 ```bash
-python python/evaluate_models.py ... --load-in-4bit
+python python/evaluate_models.py ... --base-load-mode 4bit
 ```
 
 ## Troubleshooting

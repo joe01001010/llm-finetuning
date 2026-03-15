@@ -11,6 +11,7 @@ from typing import Any
 
 SCRIPT = Path(__file__).resolve()
 ROOT = SCRIPT.parent.parent
+VALID_LOAD_MODES = {"4bit", "16bit", "32bit"}
 
 
 def args_parser() -> argparse.Namespace:
@@ -27,7 +28,17 @@ def args_parser() -> argparse.Namespace:
     p.add_argument("--max-new-tokens", type=int, default=128)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
-    p.add_argument("--load-in-4bit", action="store_true")
+    p.add_argument(
+        "--base-load-mode",
+        choices=["4bit", "16bit", "32bit"],
+        default="16bit",
+        help="Precision used for the baseline model in evaluation.",
+    )
+    p.add_argument(
+        "--load-in-4bit",
+        action="store_true",
+        help="Deprecated alias for --base-load-mode 4bit.",
+    )
     p.add_argument("--trust-remote-code", action="store_true")
     return p.parse_args()
 
@@ -35,6 +46,51 @@ def args_parser() -> argparse.Namespace:
 def resolve(path_s: str) -> Path:
     p = Path(path_s)
     return p if p.is_absolute() else ROOT / p
+
+
+def normalize_load_mode(load_mode: str | None, fallback: str) -> str:
+    """
+    This function normalizes load-mode values to the supported set
+    """
+    if load_mode in VALID_LOAD_MODES:
+        return load_mode
+    return fallback
+
+
+def load_runtime_config(adapter_path: str) -> dict[str, Any]:
+    """
+    This function loads the adapter runtime metadata if it exists
+    """
+    runtime_path = resolve(adapter_path) / "adapter_runtime_config.json"
+    if not runtime_path.exists():
+        return {}
+    try:
+        payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def infer_load_mode(label: str, adapter: str | None, args: argparse.Namespace) -> str:
+    """
+    This function determines how each model should be loaded for evaluation
+    """
+    if label == "base":
+        if args.load_in_4bit:
+            return "4bit"
+        return args.base_load_mode
+
+    if adapter is not None:
+        runtime = load_runtime_config(adapter)
+        runtime_mode = normalize_load_mode(runtime.get("base_model_load_mode"), "")
+        if runtime_mode:
+            return runtime_mode
+
+    if label == "qlora":
+        return "4bit"
+    if label == "lora":
+        return "16bit"
+    return "16bit"
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
@@ -267,15 +323,18 @@ def load_tokenizer(model_path: str, trust_remote_code: bool):
     return tok
 
 
-def load_model(model_path: str, trust_remote_code: bool, load_in_4bit: bool):
+def load_model(model_path: str, trust_remote_code: bool, load_mode: str):
     import torch
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     kw: dict[str, Any] = {"trust_remote_code": trust_remote_code}
-    if load_in_4bit:
+    if load_mode == "4bit":
         kw["device_map"] = "auto"
         kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
     else:
-        dt = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8) else (torch.float16 if torch.cuda.is_available() else torch.float32)
+        if load_mode == "16bit":
+            dt = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8) else (torch.float16 if torch.cuda.is_available() else torch.float32)
+        else:
+            dt = torch.float32
         kw["dtype"] = dt
     try:
         return AutoModelForCausalLM.from_pretrained(model_path, **kw)
@@ -382,8 +441,11 @@ def main() -> None:
     schema = infer_schema(ex)
     labels = [("base", None), ("lora", a.lora_adapter), ("qlora", a.qlora_adapter)]
     out: dict[str, dict[str, Any]] = {}
+    load_modes: dict[str, str] = {}
     for label, adapter in labels:
-        m = load_model(a.base_model, a.trust_remote_code, a.load_in_4bit)
+        load_mode = infer_load_mode(label, adapter, a)
+        load_modes[label] = load_mode
+        m = load_model(a.base_model, a.trust_remote_code, load_mode)
         if adapter is not None:
             m = apply_adapter(m, adapter)
         out[label] = eval_model(m, tok, ex, schema, a)
@@ -397,7 +459,7 @@ def main() -> None:
 
     base = out["base"]["summary"]; lora = out["lora"]["summary"]; qlora = out["qlora"]["summary"]
     report = {
-        "config": {"base_model": a.base_model, "lora_adapter": a.lora_adapter, "qlora_adapter": a.qlora_adapter, "dataset": str(dataset), "max_samples": a.max_samples, "max_new_tokens": a.max_new_tokens, "temperature": a.temperature, "top_p": a.top_p, "seed": a.seed, "load_in_4bit": a.load_in_4bit},
+        "config": {"base_model": a.base_model, "lora_adapter": a.lora_adapter, "qlora_adapter": a.qlora_adapter, "dataset": str(dataset), "max_samples": a.max_samples, "max_new_tokens": a.max_new_tokens, "temperature": a.temperature, "top_p": a.top_p, "seed": a.seed, "base_load_mode": load_modes["base"], "lora_load_mode": load_modes["lora"], "qlora_load_mode": load_modes["qlora"]},
         "metric_definitions": {"accuracy": "Mean per-field score against reference JSON.", "hallucination_rate": "Fraction with format/schema violations.", "a1_score": "Mean(accuracy * (1 - hallucinated))."},
         "models": {"base": base, "lora": lora, "qlora": qlora},
         "comparisons_vs_base": {
