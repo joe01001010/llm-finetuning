@@ -139,8 +139,8 @@ python python/train_model.py \
   --num-train-epochs 1 \
   --batch-size 1 \
   --mini-batch-size 1 \
-  --max-prompt-length 512 \
-  --max-new-tokens 48
+  --max-prompt-length 256 \
+  --max-new-tokens 24
 ```
 
 ### Train LoRA with PPO
