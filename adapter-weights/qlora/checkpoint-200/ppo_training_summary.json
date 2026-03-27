@@ -1,0 +1,12 @@
+{
+  "global_step": 200,
+  "avg_reward": -0.25,
+  "avg_accuracy": 0.0,
+  "avg_a1_score": 0.0,
+  "avg_exact_json_match": 0.0,
+  "reason_counts": {
+    "invalid_json": 194,
+    "missing_keys": 6,
+    "wrapped_json": 6
+  }
+}

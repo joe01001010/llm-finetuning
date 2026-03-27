@@ -4,8 +4,6 @@ PPO-based adapter training for the Seattle weather chat dataset.
 """
 #!/usr/bin/env python
 
-from __future__ import annotations
-
 import argparse
 import json
 import random
