@@ -6,10 +6,12 @@ This program is designed to prompt the locally hosted model and ensure it is usa
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from ppo_utils import resolve_pretrained_source
 
 
 MODEL_PATH = "/local-containers/Qwen2-7B-Instruct"
-TOKENIZER = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=True)
+TOKENIZER_SOURCE, TOKENIZER_IS_LOCAL = resolve_pretrained_source(MODEL_PATH, kind="tokenizer")
+TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_SOURCE, use_fast=True, local_files_only=TOKENIZER_IS_LOCAL)
 
 
 def ask(user_text: str, model, max_new_tokens: int = 200):
@@ -40,10 +42,12 @@ def ask(user_text: str, model, max_new_tokens: int = 200):
 
 
 def main():
+    model_source, is_local = resolve_pretrained_source(MODEL_PATH, kind="model")
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
+        model_source,
         dtype=torch.bfloat16,
-        device_map="auto"
+        device_map="auto",
+        local_files_only=is_local,
     )
 
     model.eval()

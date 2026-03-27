@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,44 @@ def resolve_path(path_like: str | Path, root: Path | None = None) -> Path:
     if root is None:
         return path.resolve()
     return (root / path).resolve()
+
+
+def looks_like_local_path(path_like: str | Path) -> bool:
+    text = str(path_like)
+    return (
+        text.startswith(".")
+        or text.startswith("/")
+        or text.startswith("\\")
+        or os.path.sep in text
+        or (os.path.altsep is not None and os.path.altsep in text)
+        or (len(text) >= 2 and text[1] == ":")
+    )
+
+
+def resolve_pretrained_source(
+    source: str | Path,
+    *,
+    root: Path | None = None,
+    kind: str = "model",
+) -> tuple[str, bool]:
+    """
+    Resolve a model/tokenizer identifier into either a verified local path or a
+    Hub repo ID. Local-looking paths are validated eagerly so callers get a
+    helpful error instead of a Hugging Face repo-id validation traceback.
+    """
+    source_text = str(source)
+    if not looks_like_local_path(source_text):
+        return source_text, False
+
+    candidate = resolve_path(source_text, root)
+    if candidate.exists():
+        return str(candidate), True
+
+    raise FileNotFoundError(
+        f"Local {kind} path was not found: {candidate}\n"
+        f"If you intended to use the locally pulled model, verify the path is mounted "
+        f"inside the container and run `python python/pull_model.py` first."
+    )
 
 
 def save_json(path: Path, payload: Any) -> None:

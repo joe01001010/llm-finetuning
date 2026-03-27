@@ -16,7 +16,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from ppo_config import RewardConfig, add_reward_config_args, reward_config_from_args
 from ppo_data import WeatherPromptExample, load_weather_prompt_examples
 from ppo_reward import compute_weather_reward
-from ppo_utils import ensure_pad_token, resolve_path, save_json, write_jsonl
+from ppo_utils import ensure_pad_token, resolve_path, resolve_pretrained_source, save_json, write_jsonl
 from weather_json_metrics import infer_schema, norm, token_f1
 
 
@@ -74,7 +74,13 @@ def infer_load_mode(label: str, adapter_path: Path | None, base_load_mode: str) 
 
 def load_tokenizer(tokenizer_path: str, base_model_path: str, trust_remote_code: bool):
     load_path = tokenizer_path or base_model_path
-    tokenizer = AutoTokenizer.from_pretrained(load_path, use_fast=True, trust_remote_code=trust_remote_code)
+    tokenizer_source, is_local = resolve_pretrained_source(load_path, kind="tokenizer")
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_source,
+        use_fast=True,
+        trust_remote_code=trust_remote_code,
+        local_files_only=is_local,
+    )
     ensure_pad_token(tokenizer)
     tokenizer.padding_side = "left"
     return tokenizer
@@ -89,6 +95,7 @@ def get_compute_dtype() -> torch.dtype:
 
 
 def load_base_model(model_path: str, load_mode: str, trust_remote_code: bool):
+    model_source, is_local = resolve_pretrained_source(model_path, kind="model")
     compute_dtype = get_compute_dtype()
     if load_mode == "4bit":
         quantization_config = BitsAndBytesConfig(
@@ -98,16 +105,17 @@ def load_base_model(model_path: str, load_mode: str, trust_remote_code: bool):
             bnb_4bit_compute_dtype=compute_dtype,
         )
         return AutoModelForCausalLM.from_pretrained(
-            model_path,
+            model_source,
             quantization_config=quantization_config,
             device_map="auto",
             trust_remote_code=trust_remote_code,
+            local_files_only=is_local,
         )
 
-    load_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    load_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code, "local_files_only": is_local}
     if load_mode == "16bit" and compute_dtype != torch.float32:
         load_kwargs["torch_dtype"] = compute_dtype
-    model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(model_source, **load_kwargs)
     if torch.cuda.is_available():
         model.to(torch.device("cuda"))
     return model

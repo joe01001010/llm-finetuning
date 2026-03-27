@@ -21,7 +21,14 @@ from torch.utils.data import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, Trainer, TrainingArguments
 
 from ppo_data import WeatherPromptExample, load_weather_prompt_examples
-from ppo_utils import ensure_pad_token, find_lora_target_modules, resolve_path, save_json, set_seed
+from ppo_utils import (
+    ensure_pad_token,
+    find_lora_target_modules,
+    resolve_path,
+    resolve_pretrained_source,
+    save_json,
+    set_seed,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -179,6 +186,7 @@ def get_compute_dtype() -> torch.dtype:
 
 
 def load_base_model(model_path: str, mode: str, trust_remote_code: bool):
+    model_source, is_local = resolve_pretrained_source(model_path, kind="model")
     compute_dtype = get_compute_dtype()
     if mode == "qlora":
         quant_config = BitsAndBytesConfig(
@@ -188,20 +196,22 @@ def load_base_model(model_path: str, mode: str, trust_remote_code: bool):
             bnb_4bit_compute_dtype=compute_dtype,
         )
         model = AutoModelForCausalLM.from_pretrained(
-            model_path,
+            model_source,
             quantization_config=quant_config,
             device_map="auto",
             trust_remote_code=trust_remote_code,
+            local_files_only=is_local,
         )
         model = prepare_model_for_kbit_training(model)
         base_model_load_mode = "4bit"
     else:
         load_kwargs: dict[str, Any] = {
             "trust_remote_code": trust_remote_code,
+            "local_files_only": is_local,
         }
         if compute_dtype != torch.float32:
             load_kwargs["torch_dtype"] = compute_dtype
-        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+        model = AutoModelForCausalLM.from_pretrained(model_source, **load_kwargs)
         base_model_load_mode = "16bit" if compute_dtype != torch.float32 else "32bit"
 
     model.config.use_cache = False
@@ -244,7 +254,13 @@ def prepare_model_for_training(model, tokenizer, args: argparse.Namespace):
 
 def load_tokenizer(tokenizer_path: str, fallback_model_path: str, trust_remote_code: bool):
     load_path = tokenizer_path or fallback_model_path
-    tokenizer = AutoTokenizer.from_pretrained(load_path, use_fast=True, trust_remote_code=trust_remote_code)
+    tokenizer_source, is_local = resolve_pretrained_source(load_path, kind="tokenizer")
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_source,
+        use_fast=True,
+        trust_remote_code=trust_remote_code,
+        local_files_only=is_local,
+    )
     ensure_pad_token(tokenizer)
     tokenizer.padding_side = "right"
     return tokenizer

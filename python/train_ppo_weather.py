@@ -39,6 +39,7 @@ from ppo_utils import (
     masked_whiten,
     model_device,
     resolve_path,
+    resolve_pretrained_source,
     save_json,
     set_seed,
     tensor_dict_to_device,
@@ -110,7 +111,13 @@ def resolve_output_dir(args: argparse.Namespace) -> Path:
 
 def load_tokenizer(tokenizer_path: str, fallback_model_path: str, trust_remote_code: bool):
     load_path = tokenizer_path or fallback_model_path
-    tokenizer = AutoTokenizer.from_pretrained(load_path, use_fast=True, trust_remote_code=trust_remote_code)
+    tokenizer_source, is_local = resolve_pretrained_source(load_path, kind="tokenizer")
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_source,
+        use_fast=True,
+        trust_remote_code=trust_remote_code,
+        local_files_only=is_local,
+    )
     ensure_pad_token(tokenizer)
     tokenizer.padding_side = "left"
     return tokenizer
@@ -122,6 +129,7 @@ def load_lm_backbone(
     trust_remote_code: bool,
     device_map: str | None,
 ):
+    model_source, is_local = resolve_pretrained_source(model_path, kind="model")
     compute_dtype = get_compute_dtype()
     if load_mode == "4bit":
         quant_config = BitsAndBytesConfig(
@@ -131,17 +139,18 @@ def load_lm_backbone(
             bnb_4bit_compute_dtype=compute_dtype,
         )
         model = AutoModelForCausalLM.from_pretrained(
-            model_path,
+            model_source,
             quantization_config=quant_config,
             device_map=device_map or "auto",
             trust_remote_code=trust_remote_code,
+            local_files_only=is_local,
         )
         return model, "4bit", compute_dtype
 
-    load_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    load_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code, "local_files_only": is_local}
     if compute_dtype != torch.float32 and load_mode == "16bit":
         load_kwargs["torch_dtype"] = compute_dtype
-    model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(model_source, **load_kwargs)
     if device_map is None and torch.cuda.is_available():
         model.to(torch.device("cuda"))
     resolved_load_mode = "16bit" if load_mode == "16bit" and compute_dtype != torch.float32 else load_mode

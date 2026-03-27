@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 from weather_json_metrics import infer_schema, norm, score_struct, token_f1
+from ppo_utils import resolve_pretrained_source
 
 SCRIPT = Path(__file__).resolve()
 ROOT = SCRIPT.parent.parent
@@ -156,7 +157,8 @@ def extract_examples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def load_tokenizer(model_path: str, trust_remote_code: bool):
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    tokenizer_source, is_local = resolve_pretrained_source(model_path, kind="tokenizer")
+    tok = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=trust_remote_code, local_files_only=is_local)
     if tok.pad_token is None and tok.eos_token is not None:
         tok.pad_token = tok.eos_token
     return tok
@@ -165,7 +167,8 @@ def load_tokenizer(model_path: str, trust_remote_code: bool):
 def load_model(model_path: str, trust_remote_code: bool, load_mode: str):
     import torch
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-    kw: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    model_source, is_local = resolve_pretrained_source(model_path, kind="model")
+    kw: dict[str, Any] = {"trust_remote_code": trust_remote_code, "local_files_only": is_local}
     if load_mode == "4bit":
         kw["device_map"] = "auto"
         kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
@@ -176,11 +179,11 @@ def load_model(model_path: str, trust_remote_code: bool, load_mode: str):
             dt = torch.float32
         kw["dtype"] = dt
     try:
-        return AutoModelForCausalLM.from_pretrained(model_path, **kw)
+        return AutoModelForCausalLM.from_pretrained(model_source, **kw)
     except TypeError:
         if "dtype" in kw:
             kw["torch_dtype"] = kw.pop("dtype")
-            return AutoModelForCausalLM.from_pretrained(model_path, **kw)
+            return AutoModelForCausalLM.from_pretrained(model_source, **kw)
         raise
 
 
