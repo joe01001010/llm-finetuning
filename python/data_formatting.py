@@ -1,15 +1,12 @@
 """
-Full training pipeline for Qwen 7B fine-tuning.
+Dataset preparation for the Seattle weather fine-tuning project.
 
-This script handles:
-- Pulling data from Kaggle
-- Data preprocessing
-- LoRA fine-tuning
-- PPO optimization
-- Evaluation and logging
-
-Author: Joe Weibel
-Date: 26 Feb 2026
+This script:
+- pulls the raw Kaggle dataset
+- cleans and sorts the weather records
+- formats chat-style SFT examples
+- writes train and eval JSONL files that can also be converted into
+  prompt-only PPO rollouts later
 """
 #!/usr/bin/env python
 
