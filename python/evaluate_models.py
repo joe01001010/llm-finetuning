@@ -8,6 +8,8 @@ import statistics
 import time
 from pathlib import Path
 from typing import Any
+from weather_json_metrics import infer_schema, norm, score_struct, token_f1
+from ppo_utils import resolve_pretrained_source
 
 SCRIPT = Path(__file__).resolve()
 ROOT = SCRIPT.parent.parent
@@ -153,171 +155,10 @@ def extract_examples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 break
     return ex
 
-
-def norm(s: str) -> str:
-    return " ".join(s.strip().lower().split())
-
-
-def token_f1(pred: str, ref: str) -> float:
-    a = norm(pred).split()
-    b = norm(ref).split()
-    if not a and not b:
-        return 1.0
-    if not a or not b:
-        return 0.0
-    ca: dict[str, int] = {}
-    cb: dict[str, int] = {}
-    for t in a:
-        ca[t] = ca.get(t, 0) + 1
-    for t in b:
-        cb[t] = cb.get(t, 0) + 1
-    common = sum(min(v, cb.get(k, 0)) for k, v in ca.items())
-    if common == 0:
-        return 0.0
-    p = common / len(a)
-    r = common / len(b)
-    return 2 * p * r / (p + r)
-
-
-def first_json_obj(text: str) -> str | None:
-    depth = 0
-    start = -1
-    in_str = False
-    esc = False
-    for i, ch in enumerate(text):
-        if esc:
-            esc = False
-            continue
-        if ch == "\\":
-            esc = True
-            continue
-        if ch == '"':
-            in_str = not in_str
-            continue
-        if in_str:
-            continue
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}" and depth > 0:
-            depth -= 1
-            if depth == 0 and start >= 0:
-                return text[start : i + 1]
-    return None
-
-
-def parse_obj(text: str) -> tuple[dict[str, Any] | None, list[str]]:
-    reasons: list[str] = []
-    t = text.strip()
-    if not t:
-        return None, ["empty_output"]
-    try:
-        val = json.loads(t)
-        if isinstance(val, str):
-            val = json.loads(val)
-        if isinstance(val, dict):
-            return val, reasons
-        return None, ["non_object_json"]
-    except json.JSONDecodeError:
-        pass
-    frag = first_json_obj(t)
-    if frag is None:
-        return None, ["invalid_json"]
-    try:
-        val = json.loads(frag)
-    except json.JSONDecodeError:
-        return None, ["invalid_json"]
-    if not isinstance(val, dict):
-        return None, ["non_object_json"]
-    return val, ["wrapped_json"]
-
-
-def infer_schema(examples: list[dict[str, Any]]) -> tuple[list[str], set[str], dict[str, tuple[float, float]], dict[str, set[str]]] | None:
-    refs = []
-    for x in examples:
-        r = x.get("reference")
-        if r is None:
-            continue
-        obj, _ = parse_obj(r)
-        if obj is not None:
-            refs.append(obj)
-    if not refs:
-        return None
-    keys = set(refs[0].keys())
-    for r in refs[1:]:
-        keys &= set(r.keys())
-    if not keys:
-        return None
-    ordered = [k for k in refs[0].keys() if k in keys]
-    numeric: set[str] = set()
-    ranges: dict[str, tuple[float, float]] = {}
-    allowed: dict[str, set[str]] = {}
-    for k in ordered:
-        vals = []
-        ok = True
-        for r in refs:
-            try:
-                vals.append(float(r[k]))
-            except Exception:
-                ok = False
-                break
-        if ok and vals:
-            numeric.add(k)
-            ranges[k] = (min(vals), max(vals))
-        else:
-            allowed[k] = {norm(str(r.get(k))) for r in refs if r.get(k) is not None}
-    return ordered, numeric, ranges, allowed
-
-
-def score_struct(pred: str, ref: str, schema) -> dict[str, Any]:
-    keys, numeric, ranges, allowed = schema
-    ro, _ = parse_obj(ref)
-    po, rs = parse_obj(pred)
-    reasons = set(rs)
-    if ro is None or po is None:
-        return {"accuracy": 0.0, "hallucinated": 1, "a1_score": 0.0, "exact_json_match": 0, "reasons": sorted(reasons)}
-    miss = [k for k in keys if k not in po]
-    extra = [k for k in po.keys() if k not in keys]
-    if miss:
-        reasons.add("missing_keys")
-    if extra:
-        reasons.add("extra_keys")
-    scores = []
-    exact = True
-    for k in keys:
-        if k not in po:
-            scores.append(0.0)
-            exact = False
-            continue
-        if k in numeric:
-            try:
-                pv = float(po[k]); rv = float(ro[k])
-                lo, hi = ranges.get(k, (rv, rv))
-                sc = max(0.0, 1.0 - abs(pv - rv) / max(hi - lo, 1.0))
-            except Exception:
-                sc = 0.0
-                reasons.add(f"non_numeric:{k}")
-            scores.append(sc)
-            if sc < 1.0:
-                exact = False
-        else:
-            p = norm(str(po[k])); r = norm(str(ro[k]))
-            sc = 1.0 if p == r else 0.0
-            scores.append(sc)
-            if sc < 1.0:
-                exact = False
-            if allowed.get(k) and p not in allowed[k]:
-                reasons.add(f"out_of_domain:{k}")
-    acc = statistics.mean(scores) if scores else 0.0
-    hall = int(bool(reasons))
-    a1 = acc * (1 - hall)
-    return {"accuracy": round(acc, 6), "hallucinated": hall, "a1_score": round(a1, 6), "exact_json_match": int(exact and not miss and not extra), "reasons": sorted(reasons)}
-
-
 def load_tokenizer(model_path: str, trust_remote_code: bool):
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    tokenizer_source, is_local = resolve_pretrained_source(model_path, kind="tokenizer")
+    tok = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=trust_remote_code, local_files_only=is_local)
     if tok.pad_token is None and tok.eos_token is not None:
         tok.pad_token = tok.eos_token
     return tok
@@ -326,7 +167,8 @@ def load_tokenizer(model_path: str, trust_remote_code: bool):
 def load_model(model_path: str, trust_remote_code: bool, load_mode: str):
     import torch
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-    kw: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    model_source, is_local = resolve_pretrained_source(model_path, kind="model")
+    kw: dict[str, Any] = {"trust_remote_code": trust_remote_code, "local_files_only": is_local}
     if load_mode == "4bit":
         kw["device_map"] = "auto"
         kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
@@ -337,11 +179,11 @@ def load_model(model_path: str, trust_remote_code: bool, load_mode: str):
             dt = torch.float32
         kw["dtype"] = dt
     try:
-        return AutoModelForCausalLM.from_pretrained(model_path, **kw)
+        return AutoModelForCausalLM.from_pretrained(model_source, **kw)
     except TypeError:
         if "dtype" in kw:
             kw["torch_dtype"] = kw.pop("dtype")
-            return AutoModelForCausalLM.from_pretrained(model_path, **kw)
+            return AutoModelForCausalLM.from_pretrained(model_source, **kw)
         raise
 
 
