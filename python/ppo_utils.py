@@ -159,15 +159,16 @@ def decode_responses(tokenizer, response_ids: torch.Tensor, response_mask: torch
 
 
 def logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    token_logprobs = logits[:, :-1, :].log_softmax(dim=-1)
+    token_logprobs = logits[:, :-1, :].float().log_softmax(dim=-1)
     gathered = token_logprobs.gather(dim=-1, index=labels[:, 1:].unsqueeze(-1)).squeeze(-1)
-    return gathered
+    return torch.nan_to_num(gathered, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
-    log_probs = logits.log_softmax(dim=-1)
+    log_probs = logits.float().log_softmax(dim=-1)
     probs = log_probs.exp()
-    return -(probs * log_probs).sum(dim=-1)
+    entropy = -(probs * log_probs).sum(dim=-1)
+    return torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor, dim: int | None = None) -> torch.Tensor:

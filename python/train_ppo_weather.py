@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -256,12 +255,12 @@ def prepare_reference_model(args: argparse.Namespace):
 def get_response_stats(policy_model, sequence_ids: torch.Tensor, attention_mask: torch.Tensor, prompt_width: int, response_width: int):
     outputs = policy_model(input_ids=sequence_ids, attention_mask=attention_mask)
     token_logprobs = logprobs_from_logits(outputs["logits"], sequence_ids)
-    token_values = outputs["values"][:, :-1]
+    token_values = torch.nan_to_num(outputs["values"][:, :-1].float(), nan=0.0, posinf=0.0, neginf=0.0)
     start_index = max(prompt_width - 1, 0)
     end_index = start_index + response_width
-    response_logprobs = token_logprobs[:, start_index:end_index]
-    response_values = token_values[:, start_index:end_index]
-    response_logits = outputs["logits"][:, start_index:end_index, :]
+    response_logprobs = torch.nan_to_num(token_logprobs[:, start_index:end_index], nan=0.0, posinf=0.0, neginf=0.0)
+    response_values = torch.nan_to_num(token_values[:, start_index:end_index], nan=0.0, posinf=0.0, neginf=0.0)
+    response_logits = torch.nan_to_num(outputs["logits"][:, start_index:end_index, :].float(), nan=0.0, posinf=0.0, neginf=0.0)
     return response_logprobs, response_values, response_logits
 
 
@@ -271,7 +270,7 @@ def get_reference_logprobs(reference_model, sequence_ids: torch.Tensor, attentio
     token_logprobs = logprobs_from_logits(outputs.logits, sequence_ids)
     start_index = max(prompt_width - 1, 0)
     end_index = start_index + response_width
-    return token_logprobs[:, start_index:end_index]
+    return torch.nan_to_num(token_logprobs[:, start_index:end_index], nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def collect_rollout(
@@ -301,6 +300,8 @@ def collect_rollout(
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,
         "do_sample": args.temperature > 0.0,
+        "renormalize_logits": True,
+        "remove_invalid_values": True,
     }
     if args.temperature > 0.0:
         generation_kwargs["temperature"] = args.temperature
@@ -351,8 +352,8 @@ def collect_rollout(
         a1_values.append(float(breakdown["a1_score"]))
         exact_json_values.append(float(breakdown["exact_json_match"]))
 
-    score_reward_tensor = torch.tensor(score_rewards, device=device, dtype=old_values.dtype)
-    rewards = -args.kl_coef * (old_logprobs - ref_logprobs)
+    score_reward_tensor = torch.tensor(score_rewards, device=device, dtype=torch.float32)
+    rewards = -args.kl_coef * torch.nan_to_num(old_logprobs - ref_logprobs, nan=0.0, posinf=0.0, neginf=0.0)
     rewards = rewards * response_mask
     last_token_indices = response_mask.long().sum(dim=1) - 1
     for row_index, last_index in enumerate(last_token_indices.tolist()):
@@ -367,7 +368,11 @@ def collect_rollout(
         gae_lambda=args.gae_lambda,
     )
     advantages = masked_whiten(advantages, response_mask)
-    kl_divergence = masked_mean(old_logprobs - ref_logprobs, response_mask, dim=1)
+    kl_divergence = masked_mean(
+        torch.nan_to_num(old_logprobs - ref_logprobs, nan=0.0, posinf=0.0, neginf=0.0),
+        response_mask,
+        dim=1,
+    )
 
     return RolloutBatch(
         prompt_width=prompt_width,
@@ -404,6 +409,7 @@ def optimize_policy(
     policy_model.train()
     stats: defaultdict[str, list[float]] = defaultdict(list)
     step_count = 0
+    trainable_parameters = [parameter for parameter in policy_model.parameters() if parameter.requires_grad]
     optimizer.zero_grad(set_to_none=True)
 
     for _ppo_epoch in range(args.ppo_epochs):
@@ -419,7 +425,12 @@ def optimize_policy(
             new_logprobs = new_logprobs * response_mask
             new_values = new_values * response_mask
 
-            ratio = torch.exp(new_logprobs - minibatch["old_logprobs"])
+            log_ratio = torch.clamp(
+                torch.nan_to_num(new_logprobs - minibatch["old_logprobs"], nan=0.0, posinf=0.0, neginf=0.0),
+                min=-20.0,
+                max=20.0,
+            )
+            ratio = torch.exp(log_ratio)
             unclipped = ratio * minibatch["advantages"]
             clipped = torch.clamp(ratio, 1.0 - args.clip_range, 1.0 + args.clip_range) * minibatch["advantages"]
             policy_loss = -masked_mean(torch.minimum(unclipped, clipped), response_mask)
@@ -434,18 +445,31 @@ def optimize_policy(
             entropy_bonus = masked_mean(response_entropy, response_mask)
 
             loss = policy_loss + args.value_loss_coef * value_loss - args.entropy_coef * entropy_bonus
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                stats["skipped_non_finite_loss"].append(1.0)
+                continue
             (loss / args.gradient_accumulation_steps).backward()
 
             step_count += 1
             if step_count % args.gradient_accumulation_steps == 0:
-                clip_grad_norm_(
-                    [parameter for parameter in policy_model.parameters() if parameter.requires_grad],
-                    args.max_grad_norm,
+                has_non_finite_grad = any(
+                    parameter.grad is not None and not torch.isfinite(parameter.grad).all()
+                    for parameter in trainable_parameters
                 )
+                if has_non_finite_grad:
+                    optimizer.zero_grad(set_to_none=True)
+                    stats["skipped_non_finite_grad"].append(1.0)
+                    continue
+                clip_grad_norm_(trainable_parameters, args.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                stats["skipped_non_finite_grad"].append(0.0)
 
-            approx_kl = masked_mean(minibatch["old_logprobs"] - new_logprobs, response_mask)
+            approx_kl = masked_mean(
+                torch.nan_to_num(minibatch["old_logprobs"] - new_logprobs, nan=0.0, posinf=0.0, neginf=0.0),
+                response_mask,
+            )
             clip_fraction = masked_mean((torch.abs(ratio - 1.0) > args.clip_range).to(new_logprobs.dtype), response_mask)
 
             stats["loss"].append(float(loss.detach().item()))
@@ -454,13 +478,18 @@ def optimize_policy(
             stats["entropy"].append(float(entropy_bonus.detach().item()))
             stats["approx_kl"].append(float(approx_kl.detach().item()))
             stats["clip_fraction"].append(float(clip_fraction.detach().item()))
+            stats["skipped_non_finite_loss"].append(0.0)
 
     if step_count % args.gradient_accumulation_steps != 0:
-        clip_grad_norm_(
-            [parameter for parameter in policy_model.parameters() if parameter.requires_grad],
-            args.max_grad_norm,
+        has_non_finite_grad = any(
+            parameter.grad is not None and not torch.isfinite(parameter.grad).all()
+            for parameter in trainable_parameters
         )
-        optimizer.step()
+        if not has_non_finite_grad:
+            clip_grad_norm_(trainable_parameters, args.max_grad_norm)
+            optimizer.step()
+        else:
+            stats["skipped_non_finite_grad"].append(1.0)
         optimizer.zero_grad(set_to_none=True)
 
     return {
