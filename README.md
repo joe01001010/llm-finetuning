@@ -51,11 +51,8 @@ python python/train_model.py \
   --mode qlora \
   --model-path /local-containers/Qwen2-7B-Instruct \
   --data-path /llm-finetuning/data/seattle_weather_chat_train.jsonl \
-  --output-dir /llm-finetuning/adapter-weights/sft-qlora \
-  --num-train-epochs 1 \
-  --batch-size 1 \
-  --gradient-accumulation-steps 4 \
-  --max-length 768
+  --output-dir /llm-finetuning/adapter-weights/qlora \
+  --num-train-epochs 20
 ```
 
 #### LoRA SFT
@@ -66,11 +63,8 @@ python python/train_model.py \
   --mode lora \
   --model-path /local-containers/Qwen2-7B-Instruct \
   --data-path /llm-finetuning/data/seattle_weather_chat_train.jsonl \
-  --output-dir /llm-finetuning/adapter-weights/sft-lora \
-  --num-train-epochs 1 \
-  --batch-size 1 \
-  --gradient-accumulation-steps 2 \
-  --max-length 768
+  --output-dir /llm-finetuning/adapter-weights/lora \
+  --num-train-epochs 20
 ```
 
 SFT outputs include:
@@ -90,13 +84,13 @@ cd /llm-finetuning
 python python/train_ppo_weather.py \
   --mode qlora \
   --model-path /local-containers/Qwen2-7B-Instruct \
-  --adapter-path /llm-finetuning/adapter-weights/sft-qlora \
+  --adapter-path /llm-finetuning/adapter-weights/qlora \
   --data-path /llm-finetuning/data/seattle_weather_chat_train.jsonl \
   --output-dir /llm-finetuning/adapter-weights/ppo-qlora \
-  --num-train-epochs 1 \
+  --num-train-epochs 20 \
   --rollout-batch-size 1 \
   --mini-batch-size 1 \
-  --ppo-epochs 4 \
+  --ppo-epochs 20 \
   --max-prompt-length 512 \
   --max-new-tokens 48
 ```
@@ -108,40 +102,16 @@ cd /llm-finetuning
 python python/train_ppo_weather.py \
   --mode lora \
   --model-path /local-containers/Qwen2-7B-Instruct \
-  --adapter-path /llm-finetuning/adapter-weights/sft-lora \
+  --adapter-path /llm-finetuning/adapter-weights/lora \
   --data-path /llm-finetuning/data/seattle_weather_chat_train.jsonl \
   --output-dir /llm-finetuning/adapter-weights/ppo-lora \
-  --num-train-epochs 1 \
+  --num-train-epochs 20 \
   --rollout-batch-size 1 \
   --mini-batch-size 1 \
-  --ppo-epochs 4 \
+  --ppo-epochs 20 \
   --max-prompt-length 512 \
   --max-new-tokens 48
 ```
-
-#### PPO directly from the base model with a fresh LoRA adapter
-
-```bash
-cd /llm-finetuning
-python python/train_ppo_weather.py \
-  --mode base \
-  --model-path /local-containers/Qwen2-7B-Instruct \
-  --data-path /llm-finetuning/data/seattle_weather_chat_train.jsonl \
-  --output-dir /llm-finetuning/adapter-weights/ppo-base \
-  --num-train-epochs 1 \
-  --rollout-batch-size 1 \
-  --mini-batch-size 1 \
-  --ppo-epochs 4
-```
-
-PPO outputs include:
-- adapter weights
-- tokenizer files
-- `adapter_runtime_config.json`
-- `ppo_runtime_config.json`
-- `ppo_reward_config.json`
-- `ppo_value_head.pt`
-- `ppo_training_summary.json`
 
 ## Reward Design
 
@@ -162,19 +132,6 @@ All reward weights are configurable from the CLI, for example:
 - `--malformed-json-penalty`
 
 ## Evaluation
-
-### Legacy SFT comparison
-
-```bash
-cd /llm-finetuning
-python python/evaluate_models.py \
-  --base-model /local-containers/Qwen2-7B-Instruct \
-  --lora-adapter /llm-finetuning/adapter-weights/sft-lora \
-  --qlora-adapter /llm-finetuning/adapter-weights/sft-qlora \
-  --dataset /llm-finetuning/data/seattle_weather_chat_eval.jsonl \
-  --output-report /llm-finetuning/reports/base_vs_sft.json \
-  --output-predictions /llm-finetuning/reports/base_vs_sft_predictions.jsonl
-```
 
 ### Unified base vs SFT vs PPO comparison
 
