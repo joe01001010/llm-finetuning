@@ -154,7 +154,13 @@ def decode_responses(tokenizer, response_ids: torch.Tensor, response_mask: torch
     for row_ids, row_mask in zip(response_ids, response_mask):
         valid_ids = row_ids[row_mask]
         texts.append(tokenizer.decode(valid_ids, skip_special_tokens=True).strip())
-        eos_flags.append(bool(tokenizer.eos_token_id is not None and valid_ids.numel() > 0 and valid_ids[-1].item() == tokenizer.eos_token_id))
+        eos_flags.append(
+            bool(
+                tokenizer.eos_token_id is not None
+                and valid_ids.numel() > 0
+                and valid_ids[-1].item() == tokenizer.eos_token_id
+            )
+        )
     return texts, response_lengths, torch.tensor(eos_flags, dtype=torch.bool, device=response_ids.device)
 
 

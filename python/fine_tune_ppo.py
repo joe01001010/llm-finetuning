@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """
-Compatibility entrypoint for PPO weather post-training.
+PPO post-training for the Seattle weather project.
 
-The implementation now lives in `fine_tune_ppo.py` so the PPO stage stays
-separate from SFT and evaluation while preserving the original CLI command.
+This stage is intentionally separate from `train_model.py` so the existing SFT
+LoRA / QLoRA workflow stays intact and PPO remains an optional second stage.
 """
 
 from __future__ import annotations
@@ -15,11 +15,9 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from peft import LoraConfig, PeftModel, TaskType, get_peft_model, prepare_model_for_kbit_training
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from ppo_config import PPOHyperParameters, add_reward_config_args, reward_config_from_args
 from ppo_data import WeatherPromptExample, load_weather_prompt_examples
@@ -29,21 +27,18 @@ from ppo_utils import (
     build_response_mask,
     compute_gae,
     decode_responses,
-    ensure_pad_token,
     entropy_from_logits,
-    find_lora_target_modules,
-    get_compute_dtype,
     logprobs_from_logits,
     masked_mean,
     masked_whiten,
     model_device,
     resolve_path,
-    resolve_pretrained_source,
     save_json,
     set_seed,
     tensor_dict_to_device,
 )
 from ppo_value_head import CausalLMWithValueHead
+from weather_agent import WeatherModelAgent
 from weather_json_metrics import infer_schema
 
 
@@ -72,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mini-batch-size", type=int, default=PPOHyperParameters.mini_batch_size)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=PPOHyperParameters.gradient_accumulation_steps)
     parser.add_argument("--ppo-epochs", type=int, default=PPOHyperParameters.ppo_epochs)
-    parser.add_argument("--learning-rate", type=float, default=PPOHyperParameters.learning_rate)
+    parser.add_argument("--learning-rate", type=float, default=5e-6)
     parser.add_argument("--weight-decay", type=float, default=PPOHyperParameters.weight_decay)
     parser.add_argument("--gamma", type=float, default=PPOHyperParameters.gamma)
     parser.add_argument("--gae-lambda", type=float, default=PPOHyperParameters.gae_lambda)
@@ -83,9 +78,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kl-coef", type=float, default=PPOHyperParameters.kl_coef)
     parser.add_argument("--max-grad-norm", type=float, default=PPOHyperParameters.max_grad_norm)
     parser.add_argument("--max-prompt-length", type=int, default=PPOHyperParameters.max_prompt_length)
-    parser.add_argument("--max-new-tokens", type=int, default=PPOHyperParameters.max_new_tokens)
-    parser.add_argument("--temperature", type=float, default=PPOHyperParameters.temperature)
-    parser.add_argument("--top-p", type=float, default=PPOHyperParameters.top_p)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--repetition-penalty", type=float, default=1.05)
+    parser.add_argument("--forbidden-generation-chars", default="!", help="Characters to ban during PPO rollout generation.")
+    parser.add_argument("--init-sanity-samples", type=int, default=32)
+    parser.add_argument("--min-init-json-valid-rate", type=float, default=0.25)
+    parser.add_argument("--allow-bad-init", action="store_true")
     parser.add_argument("--max-prompt-samples", type=int, default=PPOHyperParameters.max_prompt_samples)
     parser.add_argument("--save-steps", type=int, default=PPOHyperParameters.save_steps)
     parser.add_argument("--logging-steps", type=int, default=PPOHyperParameters.logging_steps)
@@ -108,82 +108,6 @@ def resolve_output_dir(args: argparse.Namespace) -> Path:
     return DEFAULT_OUTPUT_ROOT / f"ppo-{args.mode}"
 
 
-def load_tokenizer(tokenizer_path: str, fallback_model_path: str, trust_remote_code: bool):
-    load_path = tokenizer_path or fallback_model_path
-    tokenizer_source, is_local = resolve_pretrained_source(load_path, kind="tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_source,
-        use_fast=True,
-        trust_remote_code=trust_remote_code,
-        local_files_only=is_local,
-    )
-    ensure_pad_token(tokenizer)
-    tokenizer.padding_side = "left"
-    return tokenizer
-
-
-def load_lm_backbone(
-    model_path: str,
-    load_mode: str,
-    trust_remote_code: bool,
-    device_map: str | None,
-):
-    model_source, is_local = resolve_pretrained_source(model_path, kind="model")
-    compute_dtype = get_compute_dtype()
-    if load_mode == "4bit":
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=compute_dtype,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_source,
-            quantization_config=quant_config,
-            device_map=device_map or "auto",
-            trust_remote_code=trust_remote_code,
-            local_files_only=is_local,
-        )
-        return model, "4bit", compute_dtype
-
-    load_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code, "local_files_only": is_local}
-    if compute_dtype != torch.float32 and load_mode == "16bit":
-        load_kwargs["torch_dtype"] = compute_dtype
-    model = AutoModelForCausalLM.from_pretrained(model_source, **load_kwargs)
-    if device_map is None and torch.cuda.is_available():
-        model.to(torch.device("cuda"))
-    resolved_load_mode = "16bit" if load_mode == "16bit" and compute_dtype != torch.float32 else load_mode
-    return model, resolved_load_mode, compute_dtype
-
-
-def enable_model_input_grads(model) -> None:
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-        return
-
-    embeddings = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
-    if embeddings is None:
-        return
-
-    def hook(_module, _inputs, output):
-        output.requires_grad_(True)
-
-    embeddings.register_forward_hook(hook)
-
-
-def make_fresh_adapter(model, args: argparse.Namespace):
-    target_modules = find_lora_target_modules(model)
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        target_modules=target_modules,
-    )
-    return get_peft_model(model, lora_config)
-
-
 def determine_policy_load_mode(mode: str) -> str:
     if mode == "qlora":
         return "4bit"
@@ -198,29 +122,28 @@ def determine_reference_load_mode(mode: str, requested_mode: str) -> str:
     return "4bit" if torch.cuda.is_available() else "16bit"
 
 
-def prepare_policy_model(args: argparse.Namespace) -> tuple[CausalLMWithValueHead, str, torch.dtype, str]:
-    load_mode = determine_policy_load_mode(args.mode)
-    backbone, resolved_load_mode, compute_dtype = load_lm_backbone(
-        model_path=args.model_path,
-        load_mode=load_mode,
-        trust_remote_code=args.trust_remote_code,
-        device_map="auto" if load_mode == "4bit" else None,
-    )
-    if load_mode == "4bit":
-        backbone = prepare_model_for_kbit_training(backbone)
-
+def prepare_policy_model(agent: WeatherModelAgent, args: argparse.Namespace) -> tuple[CausalLMWithValueHead, str, torch.dtype, str]:
     init_source = "base_model"
     if args.adapter_path:
-        adapter_path = resolve_path(args.adapter_path, PROJECT_ROOT)
-        backbone = PeftModel.from_pretrained(backbone, str(adapter_path), is_trainable=True)
-        init_source = str(adapter_path)
+        backbone, resolved_load_mode, compute_dtype = agent.load_model_variant(
+            load_mode=determine_policy_load_mode(args.mode),
+            adapter_path=args.adapter_path,
+            is_trainable=True,
+        )
+        init_source = str(resolve_path(args.adapter_path, PROJECT_ROOT))
     else:
-        backbone = make_fresh_adapter(backbone, args)
+        backbone, resolved_load_mode, compute_dtype = agent.load_training_backbone(
+            "qlora" if args.mode == "qlora" else "lora"
+        )
+        backbone = agent.create_lora_adapter(
+            backbone,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            gradient_checkpointing=True,
+        )
 
     backbone.config.use_cache = False
-    if hasattr(backbone, "gradient_checkpointing_enable"):
-        backbone.gradient_checkpointing_enable()
-    enable_model_input_grads(backbone)
 
     policy_model = CausalLMWithValueHead(backbone, value_head_dropout=args.value_head_dropout)
     value_head_path = resolve_path(args.adapter_path, PROJECT_ROOT) / "ppo_value_head.pt" if args.adapter_path else None
@@ -232,20 +155,13 @@ def prepare_policy_model(args: argparse.Namespace) -> tuple[CausalLMWithValueHea
     return policy_model, resolved_load_mode, compute_dtype, init_source
 
 
-def prepare_reference_model(args: argparse.Namespace):
+def prepare_reference_model(agent: WeatherModelAgent, args: argparse.Namespace):
     reference_load_mode = determine_reference_load_mode(args.mode, args.reference_load_mode)
-    reference_model, resolved_load_mode, _compute_dtype = load_lm_backbone(
-        model_path=args.model_path,
+    reference_model, resolved_load_mode, _compute_dtype = agent.load_model_variant(
         load_mode=reference_load_mode,
-        trust_remote_code=args.trust_remote_code,
-        device_map="auto" if reference_load_mode == "4bit" else None,
+        adapter_path=args.adapter_path if args.adapter_path else None,
+        is_trainable=False,
     )
-    if args.adapter_path:
-        reference_model = PeftModel.from_pretrained(
-            reference_model,
-            str(resolve_path(args.adapter_path, PROJECT_ROOT)),
-            is_trainable=False,
-        )
     reference_model.eval()
     for parameter in reference_model.parameters():
         parameter.requires_grad_(False)
@@ -273,7 +189,83 @@ def get_reference_logprobs(reference_model, sequence_ids: torch.Tensor, attentio
     return torch.nan_to_num(token_logprobs[:, start_index:end_index], nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def generation_kwargs_for_policy(agent: WeatherModelAgent, tokenizer, args: argparse.Namespace) -> dict[str, Any]:
+    return agent.build_generation_kwargs(
+        tokenizer,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+        forbidden_generation_chars=args.forbidden_generation_chars,
+    )
+
+
+def run_initialization_sanity_check(
+    agent: WeatherModelAgent,
+    examples: list[WeatherPromptExample],
+    tokenizer,
+    policy_model: CausalLMWithValueHead,
+    schema,
+    reward_config,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if args.init_sanity_samples <= 0:
+        return {}
+
+    sampled_examples = examples[: args.init_sanity_samples]
+    json_valid_values: list[float] = []
+    recoverable_values: list[float] = []
+    hallucination_values: list[float] = []
+    reward_values: list[float] = []
+    sample_rows: list[dict[str, Any]] = []
+
+    policy_model.eval()
+    for example in sampled_examples:
+        prediction, _latency = agent.generate_text(
+            model=policy_model.pretrained_model,
+            tokenizer=tokenizer,
+            prompt_text=example.prompt_text,
+            max_new_tokens=args.max_new_tokens,
+            temperature=0.0,
+            top_p=1.0,
+            repetition_penalty=args.repetition_penalty,
+            forbidden_generation_chars=args.forbidden_generation_chars,
+            do_sample=False,
+        )
+        reward_value, breakdown = compute_weather_reward(
+            prediction=prediction,
+            reference=example.reference_text,
+            schema=schema,
+            config=reward_config,
+        )
+        json_valid_values.append(float(breakdown.get("json_valid", 0)))
+        recoverable_values.append(float(breakdown.get("recoverable_json", 0)))
+        hallucination_values.append(float(breakdown["hallucinated"]))
+        reward_values.append(float(reward_value))
+        sample_rows.append(
+            {
+                "id": example.sample_id,
+                "prediction": prediction,
+                "reference": example.reference_text,
+                "json_valid": breakdown.get("json_valid", 0),
+                "recoverable_json": breakdown.get("recoverable_json", 0),
+                "hallucinated": breakdown["hallucinated"],
+                "reasons": breakdown["reasons"],
+            }
+        )
+
+    summary = {
+        "num_examples": len(sample_rows),
+        "json_valid_rate": round(sum(json_valid_values) / len(json_valid_values), 4) if json_valid_values else None,
+        "recoverable_json_rate": round(sum(recoverable_values) / len(recoverable_values), 4) if recoverable_values else None,
+        "hallucination_rate": round(sum(hallucination_values) / len(hallucination_values), 4) if hallucination_values else None,
+        "avg_reward": round(sum(reward_values) / len(reward_values), 4) if reward_values else None,
+    }
+    return {"summary": summary, "samples": sample_rows}
+
+
 def collect_rollout(
+    agent: WeatherModelAgent,
     batch_examples: list[WeatherPromptExample],
     tokenizer,
     policy_model: CausalLMWithValueHead,
@@ -295,17 +287,7 @@ def collect_rollout(
     prompt_batch = tensor_dict_to_device(prompt_batch, device)
     prompt_width = int(prompt_batch["input_ids"].size(1))
 
-    generation_kwargs: dict[str, Any] = {
-        "max_new_tokens": args.max_new_tokens,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-        "do_sample": args.temperature > 0.0,
-        "renormalize_logits": True,
-        "remove_invalid_values": True,
-    }
-    if args.temperature > 0.0:
-        generation_kwargs["temperature"] = args.temperature
-        generation_kwargs["top_p"] = args.top_p
+    generation_kwargs = generation_kwargs_for_policy(agent, tokenizer, args)
 
     policy_model.eval()
     with torch.no_grad():
@@ -541,6 +523,7 @@ def build_runtime_config(
     reference_load_mode: str,
     compute_dtype: torch.dtype,
     reward_config,
+    init_sanity_summary: dict[str, Any] | None,
 ) -> dict[str, Any]:
     return {
         "training_algorithm": "ppo",
@@ -554,6 +537,7 @@ def build_runtime_config(
         "compute_dtype": str(compute_dtype).replace("torch.", ""),
         "dataset_path": str(resolve_path(args.data_path, PROJECT_ROOT)),
         "seed": args.seed,
+        "init_sanity_check": init_sanity_summary,
         "ppo": {
             "num_train_epochs": args.num_train_epochs,
             "rollout_batch_size": args.rollout_batch_size,
@@ -574,6 +558,10 @@ def build_runtime_config(
             "max_new_tokens": args.max_new_tokens,
             "temperature": args.temperature,
             "top_p": args.top_p,
+            "repetition_penalty": args.repetition_penalty,
+            "forbidden_generation_chars": args.forbidden_generation_chars,
+            "init_sanity_samples": args.init_sanity_samples,
+            "min_init_json_valid_rate": args.min_init_json_valid_rate,
             "max_prompt_samples": args.max_prompt_samples,
             "save_steps": args.save_steps,
             "logging_steps": args.logging_steps,
@@ -589,7 +577,16 @@ def main() -> None:
     output_dir = resolve_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     reward_config = reward_config_from_args(args)
-    tokenizer = load_tokenizer(args.tokenizer_path, args.model_path, args.trust_remote_code)
+    agent = WeatherModelAgent(
+        base_model_path=args.model_path,
+        tokenizer_path=args.tokenizer_path,
+        trust_remote_code=args.trust_remote_code,
+        project_root=PROJECT_ROOT,
+    )
+    tokenizer = agent.load_tokenizer(
+        adapter_path=args.adapter_path if args.adapter_path else None,
+        padding_side="left",
+    )
     examples = load_weather_prompt_examples(
         dataset_path=resolve_path(args.data_path, PROJECT_ROOT),
         tokenizer=tokenizer,
@@ -599,8 +596,28 @@ def main() -> None:
     )
     schema = infer_schema([{"reference": example.reference_text} for example in examples])
 
-    policy_model, base_model_load_mode, compute_dtype, init_source = prepare_policy_model(args)
-    reference_model, reference_load_mode = prepare_reference_model(args)
+    policy_model, base_model_load_mode, compute_dtype, init_source = prepare_policy_model(agent, args)
+    reference_model, reference_load_mode = prepare_reference_model(agent, args)
+    init_sanity = run_initialization_sanity_check(
+        agent=agent,
+        examples=examples,
+        tokenizer=tokenizer,
+        policy_model=policy_model,
+        schema=schema,
+        reward_config=reward_config,
+        args=args,
+    )
+    if init_sanity:
+        save_json(output_dir / "ppo_init_sanity_check.json", init_sanity)
+        json_valid_rate = float(init_sanity["summary"].get("json_valid_rate") or 0.0)
+        recoverable_json_rate = float(init_sanity["summary"].get("recoverable_json_rate") or 0.0)
+        if not args.allow_bad_init and json_valid_rate < args.min_init_json_valid_rate and (json_valid_rate + recoverable_json_rate) < args.min_init_json_valid_rate:
+            raise SystemExit(
+                "PPO initialization sanity check failed: the starting policy is not producing recoverable structured JSON.\n"
+                "This usually means the SFT adapter is already corrupted. Start PPO from a healthier SFT checkpoint or from the base model.\n"
+                f"json_valid_rate={json_valid_rate:.4f}, recoverable_json_rate={recoverable_json_rate:.4f}"
+            )
+
     optimizer = torch.optim.AdamW(
         [parameter for parameter in policy_model.parameters() if parameter.requires_grad],
         lr=args.learning_rate,
@@ -614,6 +631,7 @@ def main() -> None:
         reference_load_mode=reference_load_mode,
         compute_dtype=compute_dtype,
         reward_config=reward_config,
+        init_sanity_summary=init_sanity.get("summary") if init_sanity else None,
     )
 
     dataloader = DataLoader(
@@ -632,6 +650,7 @@ def main() -> None:
         for batch_examples in dataloader:
             global_step += 1
             rollout = collect_rollout(
+                agent=agent,
                 batch_examples=batch_examples,
                 tokenizer=tokenizer,
                 policy_model=policy_model,

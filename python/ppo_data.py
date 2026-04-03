@@ -2,128 +2,144 @@ from __future__ import annotations
 
 import json
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 @dataclass
 class WeatherPromptExample:
-    sample_id: int
+    sample_id: str
     prompt_text: str
     reference_text: str
-    prompt_messages: list[dict[str, str]]
-    metadata: dict[str, Any] = field(default_factory=dict)
+    messages: list[dict[str, str]]
+    metadata: dict[str, Any]
 
 
-def load_json_records(path: Path) -> list[dict[str, Any]]:
-    text = path.read_text(encoding="utf-8")
-    if path.suffix.lower() == ".jsonl":
-        records = []
-        for line_number, line in enumerate(text.splitlines(), start=1):
-            stripped = line.strip()
-            if not stripped:
+def _load_rows(dataset_path: Path) -> list[dict[str, Any]]:
+    text = dataset_path.read_text(encoding="utf-8")
+    if dataset_path.suffix.lower() == ".jsonl":
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+    else:
+        payload = json.loads(text)
+        if isinstance(payload, list):
+            rows = payload
+        elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            rows = payload["data"]
+        elif isinstance(payload, dict):
+            rows = [payload]
+        else:
+            rows = []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _normalize_messages(row: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
+    messages = row.get("messages")
+    if isinstance(messages, list) and messages:
+        normalized: list[dict[str, str]] = []
+        reference_text = ""
+        for item in messages:
+            if not isinstance(item, dict):
                 continue
-            try:
-                item = json.loads(stripped)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"Invalid JSONL record at line {line_number} in {path}: {exc}") from exc
-            if isinstance(item, dict):
-                records.append(item)
-        return records
+            role = str(item.get("role", "")).strip()
+            content = str(item.get("content", "")).strip()
+            if not role or not content:
+                continue
+            normalized.append({"role": role, "content": content})
+        if normalized and normalized[-1]["role"] == "assistant":
+            reference_text = normalized[-1]["content"]
+            normalized = normalized[:-1]
+        return normalized, reference_text
 
-    payload = json.loads(text)
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if isinstance(payload, dict):
-        if isinstance(payload.get("data"), list):
-            return [item for item in payload["data"] if isinstance(item, dict)]
-        return [payload]
-    return []
+    prompt_value = ""
+    for key in ("prompt", "input", "instruction", "question", "text"):
+        candidate = row.get(key)
+        if candidate is not None and str(candidate).strip():
+            prompt_value = str(candidate).strip()
+            break
+
+    reference_text = ""
+    for key in ("reference", "target", "answer", "output", "response"):
+        candidate = row.get(key)
+        if candidate is not None and str(candidate).strip():
+            reference_text = str(candidate).strip()
+            break
+
+    if not prompt_value:
+        return [], ""
+
+    return [{"role": "user", "content": prompt_value}], reference_text
 
 
-def clean_messages(messages: Any) -> list[dict[str, str]]:
-    if not isinstance(messages, list):
-        return []
-    cleaned: list[dict[str, str]] = []
+def _fallback_chat_prompt(messages: list[dict[str, str]]) -> str:
+    lines: list[str] = []
     for message in messages:
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role")
-        content = message.get("content")
-        if role is None or content is None:
-            continue
-        cleaned.append({"role": str(role), "content": str(content)})
-    return cleaned
+        role = message["role"].strip().lower()
+        content = message["content"].strip()
+        if role == "system":
+            lines.append(f"System: {content}")
+        elif role == "user":
+            lines.append(f"User: {content}")
+        elif role == "assistant":
+            lines.append(f"Assistant: {content}")
+        else:
+            lines.append(f"{role.title()}: {content}")
+    lines.append("Assistant:")
+    return "\n".join(lines)
 
 
-def apply_prompt_template(tokenizer, messages: list[dict[str, str]]) -> str:
+def _render_prompt(messages: list[dict[str, str]], tokenizer) -> str:
     if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    parts = [f"{message['role']}: {message['content']}" for message in messages]
-    return "\n".join(parts) + "\nassistant:"
-
-
-def record_to_example(record: dict[str, Any], sample_id: int, tokenizer) -> WeatherPromptExample | None:
-    messages = clean_messages(record.get("messages"))
-    if messages and messages[-1]["role"] == "assistant":
-        prompt_messages = messages[:-1]
-        reference_text = messages[-1]["content"]
-        if not prompt_messages or not reference_text:
-            return None
-        metadata = {key: value for key, value in record.items() if key != "messages"}
-        return WeatherPromptExample(
-            sample_id=sample_id,
-            prompt_text=apply_prompt_template(tokenizer, prompt_messages),
-            reference_text=reference_text,
-            prompt_messages=prompt_messages,
-            metadata=metadata,
-        )
-
-    prompt = None
-    for prompt_key in ("prompt", "input", "instruction", "question", "text"):
-        if record.get(prompt_key) is not None and str(record[prompt_key]).strip():
-            prompt = str(record[prompt_key])
-            break
-    if prompt is None:
-        return None
-
-    reference = None
-    for reference_key in ("reference", "target", "answer", "output", "response"):
-        if record.get(reference_key) is not None and str(record[reference_key]).strip():
-            reference = str(record[reference_key])
-            break
-    if reference is None:
-        return None
-
-    return WeatherPromptExample(
-        sample_id=sample_id,
-        prompt_text=prompt,
-        reference_text=reference,
-        prompt_messages=[{"role": "user", "content": prompt}],
-        metadata={key: value for key, value in record.items() if key not in {"prompt", "reference"}},
-    )
+        try:
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            pass
+    return _fallback_chat_prompt(messages)
 
 
 def load_weather_prompt_examples(
-    dataset_path: Path,
+    *,
+    dataset_path: str | Path,
     tokenizer,
     max_samples: int = 0,
     shuffle: bool = False,
     seed: int = 42,
 ) -> list[WeatherPromptExample]:
-    records = load_json_records(dataset_path)
+    resolved_path = Path(dataset_path)
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Weather dataset not found: {resolved_path}")
+
+    rows = _load_rows(resolved_path)
     examples: list[WeatherPromptExample] = []
-    for sample_id, record in enumerate(records):
-        example = record_to_example(record, sample_id=sample_id, tokenizer=tokenizer)
-        if example is not None:
-            examples.append(example)
+
+    for index, row in enumerate(rows):
+        messages, reference_text = _normalize_messages(row)
+        if not messages or not reference_text:
+            continue
+        prompt_text = _render_prompt(messages, tokenizer)
+        sample_id = str(row.get("id", index))
+        examples.append(
+            WeatherPromptExample(
+                sample_id=sample_id,
+                prompt_text=prompt_text,
+                reference_text=reference_text,
+                messages=messages,
+                metadata={
+                    key: value
+                    for key, value in row.items()
+                    if key not in {"messages", "prompt", "input", "instruction", "question", "text", "reference", "target", "answer", "output", "response"}
+                },
+            )
+        )
 
     if shuffle:
         rng = random.Random(seed)
         rng.shuffle(examples)
-    if max_samples > 0:
+
+    if max_samples and max_samples > 0:
         examples = examples[:max_samples]
+
     if not examples:
-        raise ValueError(f"No usable prompt/reference weather samples found in {dataset_path}.")
+        raise ValueError(f"No usable prompt/reference weather examples were found in {resolved_path}.")
+
     return examples

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -9,7 +10,7 @@ import torch
 @dataclass
 class RolloutBatch:
     prompt_width: int
-    sample_ids: list[int]
+    sample_ids: list[str]
     prompt_texts: list[str]
     reference_texts: list[str]
     response_texts: list[str]
@@ -39,20 +40,47 @@ class RolloutBatch:
     def response_length(self) -> int:
         return int(self.response_ids.size(1))
 
-    def iter_minibatches(self, mini_batch_size: int, shuffle: bool = True) -> Iterator[dict[str, torch.Tensor]]:
-        indices = torch.arange(self.batch_size, device=self.sequence_ids.device)
-        if shuffle:
-            indices = indices[torch.randperm(self.batch_size, device=indices.device)]
+    def iter_minibatches(self, mini_batch_size: int, shuffle: bool = True) -> Iterator[dict[str, Any]]:
+        if mini_batch_size <= 0:
+            raise ValueError("mini_batch_size must be positive.")
 
-        for start in range(0, self.batch_size, mini_batch_size):
-            batch_indices = indices[start : start + mini_batch_size]
-            yield {
-                "sequence_ids": self.sequence_ids[batch_indices],
-                "sequence_attention_mask": self.sequence_attention_mask[batch_indices],
-                "response_mask": self.response_mask[batch_indices],
-                "old_logprobs": self.old_logprobs[batch_indices],
-                "ref_logprobs": self.ref_logprobs[batch_indices],
-                "old_values": self.old_values[batch_indices],
-                "advantages": self.advantages[batch_indices],
-                "returns": self.returns[batch_indices],
-            }
+        indices = list(range(self.batch_size))
+        if shuffle:
+            random.shuffle(indices)
+
+        tensor_fields = (
+            "prompt_input_ids",
+            "prompt_attention_mask",
+            "sequence_ids",
+            "sequence_attention_mask",
+            "response_ids",
+            "response_mask",
+            "old_logprobs",
+            "ref_logprobs",
+            "old_values",
+            "rewards",
+            "advantages",
+            "returns",
+            "score_rewards",
+            "kl_divergence",
+            "response_lengths",
+            "eos_flags",
+        )
+        list_fields = (
+            "sample_ids",
+            "prompt_texts",
+            "reference_texts",
+            "response_texts",
+            "reward_breakdowns",
+        )
+
+        for start_index in range(0, self.batch_size, mini_batch_size):
+            batch_indices = indices[start_index : start_index + mini_batch_size]
+            index_tensor = torch.tensor(batch_indices, device=self.sequence_ids.device, dtype=torch.long)
+            minibatch: dict[str, Any] = {}
+            for field_name in tensor_fields:
+                minibatch[field_name] = getattr(self, field_name).index_select(0, index_tensor)
+            for field_name in list_fields:
+                field_value = getattr(self, field_name)
+                minibatch[field_name] = [field_value[index] for index in batch_indices]
+            yield minibatch

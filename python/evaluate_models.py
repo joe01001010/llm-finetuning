@@ -27,9 +27,11 @@ def args_parser() -> argparse.Namespace:
     p.add_argument("--max-samples", type=int, default=200)
     p.add_argument("--shuffle", action="store_true")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--max-new-tokens", type=int, default=128)
+    p.add_argument("--max-new-tokens", type=int, default=48)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--repetition-penalty", type=float, default=1.05)
+    p.add_argument("--forbidden-generation-chars", default="")
     p.add_argument(
         "--base-load-mode",
         choices=["4bit", "16bit", "32bit"],
@@ -164,6 +166,25 @@ def load_tokenizer(model_path: str, trust_remote_code: bool):
     return tok
 
 
+def resolve_tokenizer_source(base_model: str, adapter: str | None) -> str:
+    if adapter is not None:
+        adapter_path = resolve(adapter)
+        if (adapter_path / "tokenizer_config.json").exists():
+            return str(adapter_path)
+    return base_model
+
+
+def build_bad_words_ids(tokenizer, forbidden_chars: str) -> list[list[int]]:
+    bad_words: list[list[int]] = []
+    for char in forbidden_chars:
+        if char.isspace():
+            continue
+        token_ids = tokenizer.encode(char, add_special_tokens=False)
+        if len(token_ids) == 1:
+            bad_words.append(token_ids)
+    return bad_words
+
+
 def load_model(model_path: str, trust_remote_code: bool, load_mode: str):
     import torch
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
@@ -212,6 +233,8 @@ def eval_model(model, tok, examples: list[dict[str, Any]], schema, args: argpars
     halls: list[int] = []
     a1s: list[float] = []
     exjson: list[int] = []
+    json_valids: list[float] = []
+    recoverables: list[float] = []
     rc: dict[str, int] = {}
     for x in examples:
         prompt = x["prompt"]
@@ -220,10 +243,20 @@ def eval_model(model, tok, examples: list[dict[str, Any]], schema, args: argpars
         ins = tok(prompt, return_tensors="pt")
         ins = {k: v.to(dev) for k, v in ins.items()}
         n = ins["input_ids"].shape[1]
-        gkw = {"max_new_tokens": args.max_new_tokens, "pad_token_id": tok.pad_token_id, "do_sample": args.temperature > 0.0}
+        gkw = {
+            "max_new_tokens": args.max_new_tokens,
+            "pad_token_id": tok.pad_token_id,
+            "do_sample": args.temperature > 0.0,
+            "repetition_penalty": args.repetition_penalty,
+            "renormalize_logits": True,
+            "remove_invalid_values": True,
+        }
         if args.temperature > 0.0:
             gkw["temperature"] = args.temperature
             gkw["top_p"] = args.top_p
+        bad_words_ids = build_bad_words_ids(tok, args.forbidden_generation_chars)
+        if bad_words_ids:
+            gkw["bad_words_ids"] = bad_words_ids
         t0 = time.perf_counter()
         with torch.no_grad():
             out = model.generate(**ins, **gkw)
@@ -240,7 +273,7 @@ def eval_model(model, tok, examples: list[dict[str, Any]], schema, args: argpars
             if schema is not None:
                 s = score_struct(pred, ref, schema)
                 row.update(s)
-                accs.append(s["accuracy"]); halls.append(s["hallucinated"]); a1s.append(s["a1_score"]); exjson.append(s["exact_json_match"])
+                accs.append(s["accuracy"]); halls.append(s["hallucinated"]); a1s.append(s["a1_score"]); exjson.append(s["exact_json_match"]); json_valids.append(s.get("json_valid", 0)); recoverables.append(s.get("recoverable_json", 0))
                 row["hallucination_reasons"] = s["reasons"]
                 for r in s["reasons"]:
                     rc[r] = rc.get(r, 0) + 1
@@ -250,7 +283,7 @@ def eval_model(model, tok, examples: list[dict[str, Any]], schema, args: argpars
         summ["exact_match"] = round(sum(ems) / len(ems), 4); summ["token_f1"] = round(sum(f1s) / len(f1s), 4)
     if accs:
         summ["accuracy"] = round(statistics.mean(accs), 4); summ["hallucination_rate"] = round(statistics.mean(halls), 4); summ["a1_score"] = round(statistics.mean(a1s), 4)
-        summ["exact_json_match"] = round(statistics.mean(exjson), 4); summ["hallucination_reason_counts"] = dict(sorted(rc.items()))
+        summ["exact_json_match"] = round(statistics.mean(exjson), 4); summ["json_valid_rate"] = round(statistics.mean(json_valids), 4); summ["recoverable_json_rate"] = round(statistics.mean(recoverables), 4); summ["hallucination_reason_counts"] = dict(sorted(rc.items()))
     return {"summary": summ, "predictions": rows}
 
 
@@ -279,7 +312,6 @@ def main() -> None:
     if not ex:
         raise SystemExit("No usable examples found in dataset.")
 
-    tok = load_tokenizer(a.base_model, a.trust_remote_code)
     schema = infer_schema(ex)
     labels = [("base", None), ("lora", a.lora_adapter), ("qlora", a.qlora_adapter)]
     out: dict[str, dict[str, Any]] = {}
@@ -287,6 +319,7 @@ def main() -> None:
     for label, adapter in labels:
         load_mode = infer_load_mode(label, adapter, a)
         load_modes[label] = load_mode
+        tok = load_tokenizer(resolve_tokenizer_source(a.base_model, adapter), a.trust_remote_code)
         m = load_model(a.base_model, a.trust_remote_code, load_mode)
         if adapter is not None:
             m = apply_adapter(m, adapter)
@@ -302,11 +335,11 @@ def main() -> None:
     base = out["base"]["summary"]; lora = out["lora"]["summary"]; qlora = out["qlora"]["summary"]
     report = {
         "config": {"base_model": a.base_model, "lora_adapter": a.lora_adapter, "qlora_adapter": a.qlora_adapter, "dataset": str(dataset), "max_samples": a.max_samples, "max_new_tokens": a.max_new_tokens, "temperature": a.temperature, "top_p": a.top_p, "seed": a.seed, "base_load_mode": load_modes["base"], "lora_load_mode": load_modes["lora"], "qlora_load_mode": load_modes["qlora"]},
-        "metric_definitions": {"accuracy": "Mean per-field score against reference JSON.", "hallucination_rate": "Fraction with format/schema violations.", "a1_score": "Mean(accuracy * (1 - hallucinated))."},
+        "metric_definitions": {"accuracy": "Mean per-field score against reference JSON.", "hallucination_rate": "Fraction with format/schema violations.", "a1_score": "Mean(accuracy * (1 - hallucinated)).", "json_valid_rate": "Fraction of samples that parse directly as valid JSON objects.", "recoverable_json_rate": "Fraction of malformed samples whose schema fields can still be recovered."},
         "models": {"base": base, "lora": lora, "qlora": qlora},
         "comparisons_vs_base": {
-            "lora": {k: (round(lora[k] - base[k], 4) if isinstance(lora.get(k), (int, float)) and isinstance(base.get(k), (int, float)) else None) for k in ("accuracy", "hallucination_rate", "a1_score", "exact_match", "token_f1")},
-            "qlora": {k: (round(qlora[k] - base[k], 4) if isinstance(qlora.get(k), (int, float)) and isinstance(base.get(k), (int, float)) else None) for k in ("accuracy", "hallucination_rate", "a1_score", "exact_match", "token_f1")},
+            "lora": {k: (round(lora[k] - base[k], 4) if isinstance(lora.get(k), (int, float)) and isinstance(base.get(k), (int, float)) else None) for k in ("accuracy", "hallucination_rate", "a1_score", "json_valid_rate", "recoverable_json_rate", "exact_match", "token_f1")},
+            "qlora": {k: (round(qlora[k] - base[k], 4) if isinstance(qlora.get(k), (int, float)) and isinstance(base.get(k), (int, float)) else None) for k in ("accuracy", "hallucination_rate", "a1_score", "json_valid_rate", "recoverable_json_rate", "exact_match", "token_f1")},
         },
     }
     rep_path = resolve(a.output_report)
@@ -319,6 +352,9 @@ def main() -> None:
             row = {"id": b["id"], "prompt": b["prompt"], "reference": b.get("reference"), "base_prediction": b["prediction"], "lora_prediction": l["prediction"], "qlora_prediction": q["prediction"], "base_latency_sec": b["latency_sec"], "lora_latency_sec": l["latency_sec"], "qlora_latency_sec": q["latency_sec"]}
             for pfx, src in (("base", b), ("lora", l), ("qlora", q)):
                 for k in ("exact_match", "token_f1", "accuracy", "hallucinated", "a1_score", "exact_json_match"):
+                    if k in src:
+                        row[f"{pfx}_{k}"] = src[k]
+                for k in ("json_valid", "recoverable_json"):
                     if k in src:
                         row[f"{pfx}_{k}"] = src[k]
                 if "hallucination_reasons" in src:

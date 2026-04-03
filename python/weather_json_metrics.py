@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from typing import Any
+
+
+FORBIDDEN_STRUCTURED_CHARS = {"!"}
 
 
 def norm(text: str) -> str:
@@ -61,11 +66,106 @@ def first_json_obj(text: str) -> str | None:
     return None
 
 
-def parse_obj(text: str) -> tuple[dict[str, Any] | None, list[str]]:
+def repeated_symbol_run(text: str, min_run: int = 6) -> tuple[str, int] | None:
+    best_char = ""
+    best_length = 0
+    current_char = ""
+    current_length = 0
+
+    for char in text:
+        if char == current_char:
+            current_length += 1
+        else:
+            current_char = char
+            current_length = 1
+
+        if not char.isalnum() and not char.isspace() and current_length > best_length:
+            best_char = char
+            best_length = current_length
+
+    if best_length >= min_run:
+        return best_char, best_length
+    return None
+
+
+def sanitize_numeric_fragment(text: str) -> str:
+    candidate = text.strip()
+    if "!" in candidate and "." not in candidate:
+        candidate = re.sub(r"(?<=\d)!(?=\d)", ".", candidate)
+    candidate = candidate.replace("!", "")
+    candidate = "".join(char for char in candidate if char in "-0123456789.")
+    if not candidate:
+        return ""
+
+    if candidate.count(".") > 1:
+        first_dot = candidate.find(".")
+        candidate = candidate[: first_dot + 1] + candidate[first_dot + 1 :].replace(".", "")
+    if candidate in {"-", ".", "-."}:
+        return ""
+    return candidate
+
+
+def sanitize_string_fragment(text: str) -> str:
+    candidate = text.strip().strip('"').strip("'")
+    candidate = re.split(r"[,\}\n\r]", candidate, maxsplit=1)[0]
+    return candidate.strip()
+
+
+def recover_schema_object(
+    text: str,
+    schema,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if schema is None:
+        return None, []
+
+    keys, numeric_keys, _numeric_ranges, _allowed_values = schema
+    if not keys:
+        return None, []
+
+    candidate_text = first_json_obj(text) or text.strip()
+    recovered: dict[str, Any] = {}
+
+    for key in keys:
+        pattern = re.compile(rf'"{re.escape(key)}"\s*:\s*([^,\n\r\}}]+|"[^"]*")', flags=re.IGNORECASE)
+        match = pattern.search(candidate_text)
+        if match is None:
+            continue
+        raw_value = match.group(1)
+        if key in numeric_keys:
+            sanitized = sanitize_numeric_fragment(raw_value)
+            if not sanitized:
+                continue
+            try:
+                recovered[key] = float(sanitized)
+            except ValueError:
+                continue
+        else:
+            sanitized = sanitize_string_fragment(raw_value)
+            if sanitized:
+                recovered[key] = sanitized
+
+    if not recovered:
+        return None, []
+
+    reasons = ["recovered_json"]
+    return recovered, reasons
+
+
+def parse_obj(
+    text: str,
+    schema=None,
+) -> tuple[dict[str, Any] | None, list[str]]:
     reasons: list[str] = []
     stripped = text.strip()
     if not stripped:
         return None, ["empty_output"]
+
+    repeated_run = repeated_symbol_run(stripped)
+    if repeated_run is not None:
+        reasons.append(f"repeated_symbol_run:{repeated_run[0]}:{repeated_run[1]}")
+    for forbidden_char in FORBIDDEN_STRUCTURED_CHARS:
+        if forbidden_char in stripped:
+            reasons.append(f"forbidden_character:{forbidden_char}")
 
     try:
         parsed = json.loads(stripped)
@@ -73,22 +173,24 @@ def parse_obj(text: str) -> tuple[dict[str, Any] | None, list[str]]:
             parsed = json.loads(parsed)
         if isinstance(parsed, dict):
             return parsed, reasons
-        return None, ["non_object_json"]
+        return None, reasons + ["non_object_json"]
     except json.JSONDecodeError:
         pass
 
     fragment = first_json_obj(stripped)
-    if fragment is None:
-        return None, ["invalid_json"]
+    if fragment is not None:
+        try:
+            parsed = json.loads(fragment)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed, reasons + ["wrapped_json"]
 
-    try:
-        parsed = json.loads(fragment)
-    except json.JSONDecodeError:
-        return None, ["invalid_json"]
+    recovered, recovery_reasons = recover_schema_object(stripped, schema)
+    if recovered is not None:
+        return recovered, reasons + recovery_reasons
 
-    if not isinstance(parsed, dict):
-        return None, ["non_object_json"]
-    return parsed, ["wrapped_json"]
+    return None, reasons + ["invalid_json"]
 
 
 def infer_schema(examples: list[dict[str, Any]]) -> tuple[list[str], set[str], dict[str, tuple[float, float]], dict[str, set[str]]] | None:
@@ -137,18 +239,28 @@ def infer_schema(examples: list[dict[str, Any]]) -> tuple[list[str], set[str], d
     return ordered_keys, numeric_keys, numeric_ranges, allowed_values
 
 
+def is_hallucination_reason(reason: str) -> bool:
+    non_hallucination_prefixes = ("wrapped_json", "recovered_json")
+    if reason.startswith(non_hallucination_prefixes):
+        return False
+    return True
+
+
 def score_struct(prediction: str, reference: str, schema) -> dict[str, Any]:
     keys, numeric_keys, numeric_ranges, allowed_values = schema
-    reference_object, _ = parse_obj(reference)
-    prediction_object, reasons = parse_obj(prediction)
+    reference_object, _ = parse_obj(reference, schema=schema)
+    prediction_object, reasons = parse_obj(prediction, schema=schema)
     reason_set = set(reasons)
 
     if reference_object is None or prediction_object is None:
+        hallucinated = int(any(is_hallucination_reason(reason) for reason in reason_set))
         return {
             "accuracy": 0.0,
-            "hallucinated": 1,
+            "hallucinated": hallucinated or 1,
             "a1_score": 0.0,
             "exact_json_match": 0,
+            "json_valid": 0,
+            "recoverable_json": int("recovered_json" in reason_set),
             "reasons": sorted(reason_set),
         }
 
@@ -160,7 +272,7 @@ def score_struct(prediction: str, reference: str, schema) -> dict[str, Any]:
         reason_set.add("extra_keys")
 
     scores = []
-    exact = True
+    exact = "recovered_json" not in reason_set
     for key in keys:
         if key not in prediction_object:
             scores.append(0.0)
@@ -173,6 +285,8 @@ def score_struct(prediction: str, reference: str, schema) -> dict[str, Any]:
                 reference_value = float(reference_object[key])
                 low, high = numeric_ranges.get(key, (reference_value, reference_value))
                 score = max(0.0, 1.0 - abs(predicted_value - reference_value) / max(high - low, 1.0))
+                if not math.isfinite(score):
+                    score = 0.0
             except Exception:
                 score = 0.0
                 reason_set.add(f"non_numeric:{key}")
@@ -190,13 +304,15 @@ def score_struct(prediction: str, reference: str, schema) -> dict[str, Any]:
                 reason_set.add(f"out_of_domain:{key}")
 
     accuracy = sum(scores) / len(scores) if scores else 0.0
-    hallucinated = int(bool(reason_set))
+    hallucinated = int(any(is_hallucination_reason(reason) for reason in reason_set))
     a1_score = accuracy * (1 - hallucinated)
     return {
         "accuracy": round(accuracy, 6),
         "hallucinated": hallucinated,
         "a1_score": round(a1_score, 6),
         "exact_json_match": int(exact and not missing_keys and not extra_keys),
+        "json_valid": int("recovered_json" not in reason_set and "invalid_json" not in reason_set),
+        "recoverable_json": int("recovered_json" in reason_set),
         "reasons": sorted(reason_set),
     }
 
@@ -209,6 +325,8 @@ def reward_from_prediction(prediction: str, reference: str, schema) -> tuple[flo
             "hallucinated": 0,
             "a1_score": round(score, 6),
             "exact_json_match": int(norm(prediction) == norm(reference)),
+            "json_valid": 0,
+            "recoverable_json": 0,
             "reasons": [],
         }
 
@@ -217,6 +335,7 @@ def reward_from_prediction(prediction: str, reference: str, schema) -> tuple[flo
         breakdown["accuracy"]
         - (0.25 if breakdown["hallucinated"] else 0.0)
         + (0.25 if breakdown["exact_json_match"] else 0.0)
+        + (0.05 if breakdown["recoverable_json"] else 0.0)
     )
     reward = max(-1.0, min(1.25, float(reward)))
     return reward, breakdown
