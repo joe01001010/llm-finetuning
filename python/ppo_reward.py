@@ -27,8 +27,8 @@ def compute_weather_reward(
     schema,
     config: RewardConfig,
 ) -> tuple[float, dict[str, Any]]:
-    prediction_object, parse_reasons = parse_obj(prediction)
-    reference_object, _ = parse_obj(reference)
+    prediction_object, parse_reasons = parse_obj(prediction, schema=schema)
+    reference_object, _ = parse_obj(reference, schema=schema)
 
     if schema is None:
         score = token_f1(prediction, reference)
@@ -41,6 +41,7 @@ def compute_weather_reward(
             "exact_json_match": int(norm(prediction) == norm(reference)),
             "reasons": [],
             "json_valid": 0,
+            "recoverable_json": 0,
             "schema_score": 0.0,
         }
 
@@ -66,6 +67,8 @@ def compute_weather_reward(
         reward -= config.empty_response_penalty
     if json_valid:
         reward += config.json_valid_weight
+    elif breakdown.get("recoverable_json"):
+        reward += config.recoverable_json_weight
     else:
         reward -= config.malformed_json_penalty
 
@@ -85,6 +88,8 @@ def compute_weather_reward(
         reward -= config.wrapped_json_penalty
     reward -= config.out_of_domain_penalty * count_reason_prefixes(list(reasons), "out_of_domain:")
     reward -= config.non_numeric_penalty * count_reason_prefixes(list(reasons), "non_numeric:")
+    reward -= config.repeated_symbol_penalty * count_reason_prefixes(list(reasons), "repeated_symbol_run:")
+    reward -= config.forbidden_character_penalty * count_reason_prefixes(list(reasons), "forbidden_character:")
 
     verbosity_chars = extra_text_length(prediction)
     if verbosity_chars > config.verbosity_char_threshold:
@@ -95,6 +100,7 @@ def compute_weather_reward(
         **breakdown,
         "reward": round(reward, 6),
         "json_valid": json_valid,
+        "recoverable_json": int(breakdown.get("recoverable_json", 0)),
         "schema_score": round(schema_score, 6),
         "missing_keys": missing_keys,
         "extra_keys": extra_keys,

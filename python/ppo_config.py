@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 @dataclass
 class RewardConfig:
     json_valid_weight: float = 0.2
+    recoverable_json_weight: float = 0.08
     schema_weight: float = 0.15
     field_accuracy_weight: float = 0.55
     exact_json_bonus: float = 0.15
@@ -18,6 +19,8 @@ class RewardConfig:
     wrapped_json_penalty: float = 0.03
     out_of_domain_penalty: float = 0.05
     non_numeric_penalty: float = 0.05
+    repeated_symbol_penalty: float = 0.2
+    forbidden_character_penalty: float = 0.15
     reward_clip_min: float = -1.5
     reward_clip_max: float = 1.5
     verbosity_char_threshold: int = 12
@@ -58,6 +61,7 @@ class PPOHyperParameters:
 
 def add_reward_config_args(parser) -> None:
     parser.add_argument("--json-valid-weight", type=float, default=RewardConfig.json_valid_weight)
+    parser.add_argument("--recoverable-json-weight", type=float, default=RewardConfig.recoverable_json_weight)
     parser.add_argument("--schema-weight", type=float, default=RewardConfig.schema_weight)
     parser.add_argument("--field-accuracy-weight", type=float, default=RewardConfig.field_accuracy_weight)
     parser.add_argument("--exact-json-bonus", type=float, default=RewardConfig.exact_json_bonus)
@@ -70,6 +74,8 @@ def add_reward_config_args(parser) -> None:
     parser.add_argument("--wrapped-json-penalty", type=float, default=RewardConfig.wrapped_json_penalty)
     parser.add_argument("--out-of-domain-penalty", type=float, default=RewardConfig.out_of_domain_penalty)
     parser.add_argument("--non-numeric-penalty", type=float, default=RewardConfig.non_numeric_penalty)
+    parser.add_argument("--repeated-symbol-penalty", type=float, default=RewardConfig.repeated_symbol_penalty)
+    parser.add_argument("--forbidden-character-penalty", type=float, default=RewardConfig.forbidden_character_penalty)
     parser.add_argument("--reward-clip-min", type=float, default=RewardConfig.reward_clip_min)
     parser.add_argument("--reward-clip-max", type=float, default=RewardConfig.reward_clip_max)
     parser.add_argument("--verbosity-char-threshold", type=int, default=RewardConfig.verbosity_char_threshold)
@@ -78,6 +84,7 @@ def add_reward_config_args(parser) -> None:
 def reward_config_from_args(args) -> RewardConfig:
     return RewardConfig(
         json_valid_weight=args.json_valid_weight,
+        recoverable_json_weight=args.recoverable_json_weight,
         schema_weight=args.schema_weight,
         field_accuracy_weight=args.field_accuracy_weight,
         exact_json_bonus=args.exact_json_bonus,
@@ -90,6 +97,8 @@ def reward_config_from_args(args) -> RewardConfig:
         wrapped_json_penalty=args.wrapped_json_penalty,
         out_of_domain_penalty=args.out_of_domain_penalty,
         non_numeric_penalty=args.non_numeric_penalty,
+        repeated_symbol_penalty=args.repeated_symbol_penalty,
+        forbidden_character_penalty=args.forbidden_character_penalty,
         reward_clip_min=args.reward_clip_min,
         reward_clip_max=args.reward_clip_max,
         verbosity_char_threshold=args.verbosity_char_threshold,
