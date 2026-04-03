@@ -8,7 +8,8 @@ from __future__ import annotations
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from weather_agent import DEFAULT_MODEL_PATH, resolve_pretrained_source
+from ppo_utils import resolve_pretrained_source
+from weather_agent import DEFAULT_MODEL_PATH
 
 
 MODEL_PATH = DEFAULT_MODEL_PATH

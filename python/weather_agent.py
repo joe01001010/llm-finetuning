@@ -18,6 +18,8 @@ from ppo_utils import (
     tensor_dict_to_device,
 )
 
+DEFAULT_MODEL_PATH = "/local-containers/Qwen2-7B-Instruct"
+
 
 class WeatherModelAgent:
     """
