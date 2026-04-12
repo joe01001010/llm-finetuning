@@ -1,0 +1,73 @@
+{
+  "config": {
+    "base_model": "/local-containers/Qwen2-7B-Instruct",
+    "dataset": "/llm-finetuning/data/seattle_weather_chat_eval.jsonl",
+    "max_samples": 200,
+    "max_new_tokens": 64,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "load_modes": {
+      "base": "4bit",
+      "sft_lora": "4bit",
+      "sft_qlora": "4bit"
+    }
+  },
+  "metric_definitions": {
+    "accuracy": "Mean per-field score against the structured weather reference JSON.",
+    "hallucination_rate": "Fraction of generations with formatting or schema violations.",
+    "a1_score": "Mean(accuracy * (1 - hallucinated)).",
+    "exact_json_match": "Fraction of samples whose JSON matches the reference exactly.",
+    "eval_loss": "Mean teacher-forced loss on the gold completion tokens only."
+  },
+  "models": {
+    "base": {
+      "num_examples": 200,
+      "avg_latency_sec": 1.9589,
+      "median_latency_sec": 1.9415,
+      "accuracy": 0.8322,
+      "hallucination_rate": 0.0,
+      "a1_score": 0.8322,
+      "exact_json_match": 0.0,
+      "eval_loss": 1.1401,
+      "hallucination_reason_counts": {}
+    },
+    "sft_lora": {
+      "num_examples": 200,
+      "avg_latency_sec": 2.2412,
+      "median_latency_sec": 2.228,
+      "accuracy": 0.8435,
+      "hallucination_rate": 0.0,
+      "a1_score": 0.8435,
+      "exact_json_match": 0.0,
+      "eval_loss": 0.7324,
+      "hallucination_reason_counts": {}
+    },
+    "sft_qlora": {
+      "num_examples": 200,
+      "avg_latency_sec": 2.2618,
+      "median_latency_sec": 2.2473,
+      "accuracy": 0.8331,
+      "hallucination_rate": 0.0,
+      "a1_score": 0.8331,
+      "exact_json_match": 0.0,
+      "eval_loss": 0.7328,
+      "hallucination_reason_counts": {}
+    }
+  },
+  "comparisons_vs_base": {
+    "sft_lora": {
+      "accuracy": 0.0113,
+      "hallucination_rate": 0.0,
+      "a1_score": 0.0113,
+      "exact_json_match": 0.0,
+      "eval_loss": -0.4077
+    },
+    "sft_qlora": {
+      "accuracy": 0.0009,
+      "hallucination_rate": 0.0,
+      "a1_score": 0.0009,
+      "exact_json_match": 0.0,
+      "eval_loss": -0.4073
+    }
+  }
+}

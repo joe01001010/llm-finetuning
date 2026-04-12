@@ -56,11 +56,11 @@ else
   group_status=$?
 fi
 
-containers=$(docker images | grep ${DOCKER_IMAGE_NAME} | grep ${DOCKER_IMAGE_VERSION} | awk '{print $3}')
+containers=$(docker images | grep ${DOCKER_IMAGE_NAME} | grep ${DOCKER_IMAGE_VERSION} | awk '{print $2}')
 if [[ $? -ne 0 ]]
 then
   docker pull ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_VERSION}
-  containers=$(docker images | grep ${DOCKER_IMAGE_NAME} | grep ${DOCKER_IMAGE_VERSION} | awk '{print $3}')
+  containers=$(docker images | grep ${DOCKER_IMAGE_NAME} | grep ${DOCKER_IMAGE_VERSION} | awk '{print $2}')
 fi
 docker rm -f llm-finetuning
 

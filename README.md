@@ -45,6 +45,8 @@ Outputs:
 
 #### QLoRA SFT
 
+trainable params: 20,185,088 || all params: 7,635,801,600 || trainable%: 0.2643
+train runtime': 31263.9804, 'train samples per second': 1.484, 'train steps per second': 0.186, 'train loss': 0.13570245900448283, 'epoch': 20.0}
 ```bash
 cd /llm-finetuning
 python python/train_model.py \
@@ -57,6 +59,7 @@ python python/train_model.py \
 
 #### LoRA SFT
 
+trainable params: 5,046,272 || all params: 7,620,662,784 || trainable%: 0.0662
 ```bash
 cd /llm-finetuning
 python python/train_model.py \
