@@ -7,12 +7,16 @@ End-to-end local workflow for Seattle weather fine-tuning with:
 
 ## Project Layout
 
+- `python/weather_agent.py`: shared `WeatherModelAgent` class for model, tokenizer, adapter, and generation loading.
+- `python/fine_tune_sft.py`: primary Stage 1 SFT implementation.
+- `python/fine_tune_ppo.py`: primary Stage 2 PPO implementation.
+- `python/evaluate_weather.py`: primary unified evaluation implementation.
 - `python/pull_model.py`: pulls the base model locally.
 - `python/data_formatting.py`: builds the Seattle weather chat datasets.
-- `python/train_model.py`: Stage 1 SFT training for LoRA / QLoRA adapters.
-- `python/train_ppo_weather.py`: Stage 2 PPO post-training on prompt-only weather data.
+- `python/train_model.py`: compatibility entrypoint for Stage 1 SFT training.
+- `python/train_ppo_weather.py`: compatibility entrypoint for Stage 2 PPO post-training.
 - `python/evaluate_models.py`: legacy SFT comparison for base vs LoRA vs QLoRA.
-- `python/evaluate_ppo_weather.py`: unified comparison for base, SFT, and PPO models.
+- `python/evaluate_ppo_weather.py`: compatibility entrypoint for unified base, SFT, and PPO evaluation.
 - `python/ppo_data.py`: prompt-only weather dataset loading for PPO and evaluation.
 - `python/ppo_reward.py`: structured reward functions for weather JSON quality.
 - `python/ppo_utils.py`: PPO masking, KL, logprob, and GAE helpers.
@@ -21,6 +25,14 @@ End-to-end local workflow for Seattle weather fine-tuning with:
 - `python/ppo_classes.py`: conceptual PPO reference from a separate non-LLM RL project. This is not used directly for language-model training.
 
 ## Workflow
+
+The repo is now organized around one shared agent plus dedicated modules per stage:
+- `weather_agent.py` centralizes model and tokenizer loading.
+- `fine_tune_sft.py` owns SFT.
+- `fine_tune_ppo.py` owns PPO.
+- `evaluate_weather.py` owns evaluation.
+
+The original CLI commands still work through thin compatibility wrappers, so existing scripts do not need to change.
 
 ### 1. Pull the base model
 
